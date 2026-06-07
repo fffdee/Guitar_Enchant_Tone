@@ -1,0 +1,88 @@
+#include "model_store.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+
+static const char *TAG = "model_store";
+#define TOC_ENTRY 48
+
+static uint32_t rd_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+esp_err_t model_store_load(const char *path, model_pkg_t *pkg)
+{
+    if (!path || !pkg) return ESP_ERR_INVALID_ARG;
+    memset(pkg, 0, sizeof(*pkg));
+
+    FILE *f = fopen(path, "rb");
+    if (!f) { ESP_LOGE(TAG, "open %s failed", path); return ESP_FAIL; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 16) { fclose(f); return ESP_FAIL; }
+
+    uint8_t *buf = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
+    if (!buf) buf = malloc(sz);
+    if (!buf) { fclose(f); ESP_LOGE(TAG, "OOM %ld", (long)sz); return ESP_ERR_NO_MEM; }
+    if (fread(buf, 1, sz, f) != (size_t)sz) { free(buf); fclose(f); return ESP_FAIL; }
+    fclose(f);
+
+    if (rd_u32(buf) != MODEL_PKG_MAGIC) { free(buf); ESP_LOGE(TAG, "bad magic"); return ESP_FAIL; }
+    uint32_t ver = rd_u32(buf + 4), n = rd_u32(buf + 8);
+    pkg->buf = buf; pkg->buf_size = sz;
+
+    size_t off = 16;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (off + TOC_ENTRY > (size_t)sz) break;
+        const uint8_t *e = buf + off;
+        char name[17]; memcpy(name, e, 16); name[16] = 0;
+        uint32_t ndim = rd_u32(e + 20);
+        uint32_t s0 = rd_u32(e + 24), s1 = rd_u32(e + 28);
+        uint32_t doff = rd_u32(e + 40), dnb = rd_u32(e + 44);
+        if (doff + dnb > (size_t)sz) { ESP_LOGW(TAG, "section %s OOB", name); off += TOC_ENTRY; continue; }
+        const uint8_t *d = buf + doff;
+        if (!strcmp(name, "config"))      { pkg->config = (const int32_t *)d; pkg->config_n = (int)s0; }
+        else if (!strcmp(name, "weights")){ pkg->weights = d; pkg->weights_size = dnb; }
+        else if (!strcmp(name, "mel_mean")){ pkg->mel_mean = (const float *)d; pkg->mel_n = (int)s0; }
+        else if (!strcmp(name, "mel_std")) { pkg->mel_std = (const float *)d; }
+        else if (!strcmp(name, "emb"))     { pkg->emb = (const float *)d; pkg->num_inst = (int)s0; pkg->emb_dim = (int)(ndim >= 2 ? s1 : 0); }
+        else if (!strcmp(name, "names"))   { pkg->names = (const char *)d; pkg->names_len = (int)dnb; }
+        else if (!strcmp(name, "graph"))   { pkg->graph_ir = d; pkg->graph_ir_size = dnb; }
+        off += TOC_ENTRY;
+    }
+    if (!pkg->weights || !pkg->mel_mean || !pkg->mel_std || !pkg->emb) {
+        ESP_LOGE(TAG, "missing required section"); model_store_free(pkg); return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "loaded %s ver=%" PRIu32 ": weights=%zuB N=%d E=%d mel=%d",
+             path, ver, pkg->weights_size, pkg->num_inst, pkg->emb_dim, pkg->mel_n);
+    return ESP_OK;
+}
+
+void model_store_free(model_pkg_t *pkg)
+{
+    if (pkg && pkg->buf) { free(pkg->buf); pkg->buf = NULL; }
+}
+
+int model_store_instrument_id(const model_pkg_t *pkg, const char *name)
+{
+    if (!pkg || !pkg->names || !name) return -1;
+    int id = 0;
+    const char *p = pkg->names;
+    const char *end = pkg->names + pkg->names_len;
+    char cur[32];
+    while (p < end) {
+        int k = 0;
+        while (p < end && *p != '\n' && *p != '\0' && k < (int)sizeof(cur) - 1) cur[k++] = *p++;
+        cur[k] = 0;
+        while (p < end && (*p == '\n' || *p == '\0')) p++;
+        if (k > 0) {
+            if (strcmp(cur, name) == 0) return id;
+            id++;
+        }
+    }
+    return -1;
+}

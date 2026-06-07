@@ -1,0 +1,13 @@
+{
+  "sample_rate": 48000,
+  "channels": 1,
+  "instruments": ["guitar", "bass"],
+  "source": "guitar",
+  "targets": ["bass"],
+  "clip": 4,
+  "mode": "pairs",
+  "duration_s": 2.400,
+  "src_minus_tgt_first_pitch": 0,
+  "guitar_fx": "Ample Guitar M",
+  "bass_fx": "Ample Bass P"
+}

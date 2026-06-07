@@ -1,0 +1,68 @@
+{
+  "audio": {
+    "sample_rate": 48000,
+    "frame_size": 1536,
+    "hop_size": 512,
+    "fft_size": 2048
+  },
+  "feature": {
+    "feature_dim": 20,
+    "n_mfcc": 13,
+    "n_mels": 26,
+    "fmin": 30.0,
+    "fmax": 20000.0,
+    "f0_min": 55.0,
+    "f0_max": 1320.0,
+    "rolloff_percent": 0.85,
+    "silence_db": -60.0
+  },
+  "ddsp": {
+    "n_harmonics": 30,
+    "n_noise_bands": 10,
+    "output_dim": 40
+  },
+  "model": {
+    "embedding_dim": 8,
+    "channels": [
+      32,
+      64,
+      128,
+      64
+    ],
+    "kernel_size": 3,
+    "dilations": [
+      1,
+      2,
+      4,
+      1
+    ],
+    "film_layers": [
+      1,
+      2
+    ]
+  },
+  "train": {
+    "batch_size": 16,
+    "sequence_length": 64,
+    "epochs": 5,
+    "lr": 0.001,
+    "weight_decay": 0.01,
+    "noise_loss_weight": 0.5,
+    "use_stft_loss": false,
+    "stft_loss_weight": 0.1,
+    "val_ratio": 0.1,
+    "test_ratio": 0.1,
+    "seed": 42,
+    "num_workers": 0,
+    "render_every": 10,
+    "grad_clip": 1.0
+  },
+  "paths": {
+    "raw_wav_dir": "data/raw_wav",
+    "manifest_path": "data/processed/manifests/manifest.csv",
+    "features_dir": "data/processed/features",
+    "labels_dir": "data/processed/labels",
+    "splits_dir": "data/processed/splits",
+    "output_dir": "outputs"
+  }
+}

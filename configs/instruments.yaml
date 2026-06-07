@@ -1,0 +1,14 @@
+# 乐器 ID 映射与目标乐器列表
+# id 必须与训练时 embedding 矩阵的行索引一致；新增乐器在末尾追加即可。
+# 注意：当前环境未安装 pyyaml，本 YAML 仅作文档；实际生效的是 configs/instruments.json
+#       （脚本用 --instruments configs/instruments.json 传入）。
+
+instruments:
+  guitar: 0   # 源乐器（输入，主音色），不作为转换目标
+  bass: 1     # 目标音色（低音区 clip，MIDI 40-76）
+  ukulele: 2  # 目标音色（高音区 clip，MIDI 60-79，吉他∩尤克里里公共音区）
+
+# 参与训练的目标乐器（即希望吉他能转换成的音色）
+target_instruments:
+  - bass
+  - ukulele

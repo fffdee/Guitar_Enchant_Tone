@@ -1,0 +1,13 @@
+{
+  "sample_rate": 48000,
+  "channels": 1,
+  "instruments": ["guitar", "ukulele"],
+  "source": "guitar",
+  "targets": ["ukulele"],
+  "clip": 14,
+  "mode": "pairs",
+  "duration_s": 4.800,
+  "src_minus_tgt_first_pitch": 50,
+  "guitar_fx": "Ample Guitar M",
+  "ukulele_fx": "Ample Ethno U"
+}

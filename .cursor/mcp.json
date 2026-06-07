@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "reaper": {
+      "command": "C:\\Users\\BanGO\\mcp\\Reaper-MCP\\.venv\\Scripts\\reaper-mcp.exe",
+      "env": {
+        "REAPER_MCP_PROFILE": "full"
+      }
+    }
+  }
+}

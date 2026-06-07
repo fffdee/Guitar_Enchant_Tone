@@ -1,0 +1,21 @@
+# ESP-IDF 编译产物
+build/
+build_*/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+
+# 目标文件与固件
+*.o
+*.a
+*.elf
+*.bin
+*.map
+
+# CMake / IDE 构建目录
+cmake-build-*/
+
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+*$py.class

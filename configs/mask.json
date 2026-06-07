@@ -1,0 +1,54 @@
+{
+  "stft": {
+    "sample_rate": 48000,
+    "n_fft": 1024,
+    "hop": 256,
+    "n_mels": 96,
+    "fmin": 40.0,
+    "fmax": 16000.0,
+    "center": true,
+    "log_eps": 1e-05,
+    "mask_eps": 0.0001
+  },
+  "model": {
+    "hidden": 128,
+    "kernel": 3,
+    "dilation2": 2,
+    "emb_dim": 16,
+    "n_artic": 0,
+    "artic_dim": 4,
+    "gmax": 4.0,
+    "phase_bands": 64,
+    "dphi_max": 1.5707963267948966,
+    "noise_bands": 16,
+    "causal": false
+  },
+  "train": {
+    "win_frames": 128,
+    "win_stride": 64,
+    "batch_size": 32,
+    "epochs": 200,
+    "lr": 0.0003,
+    "weight_decay": 1e-05,
+    "grad_clip": 1.0,
+    "seed": 42,
+    "num_workers": 0,
+    "val_ratio": 0.1,
+    "test_ratio": 0.1,
+    "w_mask": 1.0,
+    "w_logmel": 0.5,
+    "w_mrstft": 0.1,
+    "w_cplx": 0.1,
+    "w_adv": 0.01,
+    "use_phase": true,
+    "use_adv": false,
+    "mrstft_ffts": [2048, 1024, 512],
+    "mrstft_hops": [512, 256, 128],
+    "render_every": 10
+  },
+  "paths": {
+    "raw_dir": "dataset/raw",
+    "proc_dir": "dataset/proc",
+    "output_dir": "outputs/mask"
+  }
+}

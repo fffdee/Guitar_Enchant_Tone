@@ -1,0 +1,11 @@
+{
+  "instruments": {
+    "guitar": 0,
+    "bass": 1,
+    "ukulele": 2
+  },
+  "target_instruments": [
+    "bass",
+    "ukulele"
+  ]
+}
