@@ -24,4 +24,7 @@ void  bnn_free(void *p);
 size_t bnn_mem_used(void);
 size_t bnn_mem_peak(void);
 
+/* MCU: 尝试把 buf 复制到内部 SRAM 并释放原块; 失败则原样返回 */
+void *bnn_try_promote_internal(void *buf, size_t nbytes);
+
 #endif

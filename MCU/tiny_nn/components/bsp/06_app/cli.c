@@ -38,6 +38,18 @@ static int cmd_status(int argc, char **argv)
     return 0;
 }
 
+/* ---------- stats [reset] ---------- */
+static int cmd_stats(int argc, char **argv)
+{
+    if (argc >= 2 && !strcmp(argv[1], "reset")) {
+        audio_xform_reset_stats();
+        printf("推理统计已清零\n");
+        return 0;
+    }
+    audio_xform_print_stats();
+    return 0;
+}
+
 /* ---------- ls [dir] ---------- */
 static int cmd_ls(int argc, char **argv)
 {
@@ -81,8 +93,9 @@ static audio_clip_mode_t parse_clip(const char *s)
 static int cmd_infer(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("用法: infer <乐器> [-i 输入wav] [-o 输出wav] [-p 变调半音] [-g 增益dB] [-c limit|soft|hard]\n");
+        printf("用法: infer <乐器> [-i in][-o out][-p 变调][-g 增益dB][-c limit|soft|hard][-N 开噪声注入]\n");
         printf("例:   infer bass -p -12 -g 9 -c soft\n");
+        printf("      infer bass -N            (开噪声注入; 默认关闭以避免底噪)\n");
         return 1;
     }
     if (!audio_xform_loaded()) { printf("模型未加载, 无法推理\n"); return 1; }
@@ -93,13 +106,20 @@ static int cmd_infer(int argc, char **argv)
 
     const char *in = DEF_IN_WAV;
     const char *out = NULL;
-    for (int i = 2; i + 1 < argc; i += 2) {
+    for (int i = 2; i < argc; ) {
+        if (!strcmp(argv[i], "-N")) {
+            /* 无值标志: 开启噪声注入 */
+            job.opt.add_noise = 1;
+            i++; continue;
+        }
+        if (i + 1 >= argc) { printf("参数 %s 缺少值\n", argv[i]); return 1; }
         if      (!strcmp(argv[i], "-i")) in = argv[i + 1];
         else if (!strcmp(argv[i], "-o")) out = argv[i + 1];
         else if (!strcmp(argv[i], "-p")) job.opt.pitch_semitones = strtof(argv[i + 1], NULL);
         else if (!strcmp(argv[i], "-g")) job.opt.gain_db = strtof(argv[i + 1], NULL);
         else if (!strcmp(argv[i], "-c")) job.opt.clip_mode = parse_clip(argv[i + 1]);
         else { printf("未知参数: %s\n", argv[i]); return 1; }
+        i += 2;
     }
     strncpy(job.in_path, in, sizeof(job.in_path) - 1);
     if (out) strncpy(job.out_path, out, sizeof(job.out_path) - 1);
@@ -115,8 +135,9 @@ static void register_cmds(void)
 {
     const esp_console_cmd_t cmds[] = {
         { .command = "model",  .help = "打印已加载模型信息(采样率/参数量/乐器列表)", .func = &cmd_model },
-        { .command = "infer",  .help = "推理: infer <乐器> [-i in][-o out][-p 变调][-g 增益dB][-c limit|soft|hard]", .func = &cmd_infer },
+        { .command = "infer",  .help = "推理: infer <乐器> [-i in][-o out][-p 变调][-g 增益dB][-c clip][-N 开噪声]", .func = &cmd_infer },
         { .command = "status", .help = "查看推理 worker 状态与内存", .func = &cmd_status },
+        { .command = "stats",  .help = "推理时间统计 (次数/avg/min/max/RT); stats reset 清零", .func = &cmd_stats },
         { .command = "ls",     .help = "列目录: ls [路径] (默认 /sdcard)", .func = &cmd_ls },
         { .command = "sdinfo", .help = "SD 卡挂载状态", .func = &cmd_sdinfo },
     };

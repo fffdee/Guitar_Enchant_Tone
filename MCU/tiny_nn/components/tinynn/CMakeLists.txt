@@ -9,6 +9,7 @@ set(TINYNN_SRCS
     ${TINYNN_ROOT}/operator/src/bnn_op.c
     ${TINYNN_ROOT}/operator/src/bnn_op_cpu.c
     ${TINYNN_ROOT}/operator/src/bnn_dsp_cpu.c
+    ${TINYNN_ROOT}/operator/src/bnn_nn.c
     ${TINYNN_ROOT}/operator/src/bnn_specmat.c
     ${TINYNN_ROOT}/operator/src/bnn_polyphony.c
     ${TINYNN_ROOT}/layer/src/bnn_layer.c
@@ -43,4 +44,11 @@ idf_component_register(
 )
 
 target_compile_definitions(${COMPONENT_LIB} PUBLIC BNN_PLATFORM_MCU)
+
+# 当目标为 ESP32-P4 时启用 INT8 ESP-NN conv 分支
+# 依赖: bsp 组件提供 bnn_nn_set_backend(nn_accel_nn_backend()) 注册
+if(CONFIG_IDF_TARGET_ESP32P4)
+    target_compile_definitions(${COMPONENT_LIB} PUBLIC BNN_CONV1D_INT8_ACCEL)
+endif()
+
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=format)

@@ -26,6 +26,16 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # 性能优化
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
+# CPU 360MHz (P4 默认高性能档)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
+
+# ESP-NN: P4 优化 INT8 卷积 (非 ANSI 参考实现)
+CONFIG_NN_OPTIMIZED=y
+
+# ESP-DSP: 启用 P4 RISC-V PIE 128-bit 向量优化路径
+# 使 dspm_mult_f32 / dsps_dotprod_f32 等宏自动路由到 _arp4 汇编实现
+CONFIG_DSP_OPTIMIZED=y
+
 # Task WDT: xform 推理任务固定 core1 长时间计算, 会饿死 IDLE1.
 # 关闭 CPU1 的 idle 看门狗检查, 避免批处理计算被误报 (非 panic, 但会刷屏).
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30

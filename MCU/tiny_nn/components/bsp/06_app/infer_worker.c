@@ -1,4 +1,5 @@
 #include "infer_worker.h"
+#include "audio_xform.h"
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
@@ -28,12 +29,14 @@ static struct {
     int   last_rc;
     int   last_ms;
     char  last_name[24];
+    int64_t t0_us;
 } s_st;
 
 static void st_set_busy(const char *name)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_st.busy = 1;
+    s_st.t0_us = esp_timer_get_time();
     strncpy(s_st.cur, name, sizeof(s_st.cur) - 1);
     s_st.cur[sizeof(s_st.cur) - 1] = '\0';
     xSemaphoreGive(s_lock);
@@ -128,10 +131,19 @@ void infer_worker_status(char *buf, size_t n)
     if (!s_lock) { snprintf(buf, n, "worker 未启动"); return; }
     UBaseType_t waiting = s_queue ? uxQueueMessagesWaiting(s_queue) : 0;
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (s_st.busy)
-        snprintf(buf, n, "BUSY 正在推理 '%s' | 队列等待 %u | 已完成 %d",
-                 s_st.cur, (unsigned)waiting, s_st.done);
-    else if (s_st.done > 0)
+    if (s_st.busy) {
+        int elapsed_ms = (int)((esp_timer_get_time() - s_st.t0_us) / 1000);
+        int pct = 0, frame = 0, total = 0;
+        audio_xform_infer_progress(&pct, &frame, &total);
+        int elapsed_s = elapsed_ms / 1000;
+        if (total > 0)
+            snprintf(buf, n, "BUSY '%s' %d%% (%d/%d帧) %ds | 队列%u | 完成%d",
+                     s_st.cur, pct, frame, total, elapsed_s,
+                     (unsigned)waiting, s_st.done);
+        else
+            snprintf(buf, n, "BUSY '%s' %ds (读wav/准备) | 队列%u | 完成%d",
+                     s_st.cur, elapsed_s, (unsigned)waiting, s_st.done);
+    } else if (s_st.done > 0)
         snprintf(buf, n, "IDLE | 队列等待 %u | 已完成 %d | 上次: %s rc=%d %dms",
                  (unsigned)waiting, s_st.done, s_st.last_name, s_st.last_rc, s_st.last_ms);
     else

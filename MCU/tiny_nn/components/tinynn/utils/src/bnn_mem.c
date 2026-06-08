@@ -2,6 +2,9 @@
 #include "bnn_utils/bnn_log.h"
 #include <stdlib.h>
 #include <string.h>
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#endif
 
 #ifndef BNN_STATIC_HEAP_SIZE
 #define BNN_STATIC_HEAP_SIZE (64 * 1024)
@@ -118,3 +121,18 @@ void *bnn_calloc(size_t n, size_t size)  {
 }
 size_t bnn_mem_used(void) { return g_used; }
 size_t bnn_mem_peak(void) { return g_peak; }
+
+void *bnn_try_promote_internal(void *buf, size_t nbytes)
+{
+    if (!buf || nbytes == 0) return buf;
+#ifdef ESP_PLATFORM
+    void *sram = heap_caps_aligned_alloc(16, nbytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_32BIT);
+    if (!sram) return buf;
+    memcpy(sram, buf, nbytes);
+    bnn_free(buf);
+    return sram;
+#else
+    (void)nbytes;
+    return buf;
+#endif
+}

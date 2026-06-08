@@ -8,6 +8,9 @@
  * 这些层均为"推理前向"实现(训练在 PyTorch 完成), backward 置 NULL, graph 自动跳过.
  */
 
+#include "bnn_layer.h"
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -37,6 +40,22 @@ typedef struct bnn_embedding_cfg {
     int num_embeddings;
     int dim;
 } bnn_embedding_cfg_t;
+
+/*
+ * conv1d_set_weights_i8 — 向 conv1d 层注入 INT8 量化权重.
+ *
+ *  layer  : bnn_layer_t* (type_name 须为 "conv1d")
+ *  W_i8   : int8 [Cout, Cin_K] 量化权重 (行主序)
+ *  scale  : float [Cout]       per-output-channel 量化尺度
+ *  Cout   : 输出通道数 (须与层配置一致)
+ *  Cin_K  : Cin * K (须与层配置一致)
+ *
+ * 返回 0 成功, -1 失败 (类型不匹配或 OOM 或 INT8 路径未编译).
+ * 由 bnn_masknet_load_weights_i8_mem 迭代调用.
+ */
+int conv1d_set_weights_i8(bnn_layer_t *layer,
+                          const int8_t *W_i8, const float *scale,
+                          int Cout, int Cin_K);
 
 #ifdef __cplusplus
 }

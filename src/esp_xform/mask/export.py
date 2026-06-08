@@ -28,8 +28,12 @@ from .model import FiLM
 # ---- 统一模型产物容器 xform_model.bin ----
 PKG_MAGIC = 0x4D524658      # 'XFRM' (小端)
 PKG_VERSION = 1
-PKG_DT_RAW, PKG_DT_F32, PKG_DT_I32 = 0, 1, 2
+PKG_DT_RAW, PKG_DT_F32, PKG_DT_I32, PKG_DT_I8 = 0, 1, 2, 3
 _PKG_TOC_ENTRY = 48          # name[16] + dtype(u32) + ndim(u32) + shape[4](u32) + offset(u32) + nbytes(u32)
+
+# INT8 权重段内部魔数: "NWI8" 小端
+_BNNW_I8_MAGIC   = 0x3849574E
+_BNNW_I8_VERSION = 1
 
 
 def _collect_tensors(model) -> List[np.ndarray]:
@@ -65,6 +69,64 @@ def _bnnw_bytes(model) -> bytes:
     """BNNW 权重字节流 (magic+ver+count+float32[]), 可直接喂 bnn_*_load_weights_mem。"""
     flat = np.concatenate([t.reshape(-1) for t in _collect_tensors(model)]).astype("<f4")
     return struct.pack("<II", BNN_WMAGIC, BNN_WVER) + struct.pack("<Q", int(flat.size)) + flat.tobytes()
+
+
+def _collect_conv1d_layers(model):
+    """按顺序返回模型中所有 nn.Conv1d 层 (与 _collect_tensors 中的顺序一致)。"""
+    return [m for m in model.ordered_modules() if isinstance(m, nn.Conv1d)]
+
+
+def _bnnw_i8_bytes(model) -> bytes:
+    """INT8 权重段字节流, 供 MCU model_store 解析后喂给 layer_conv1d INT8 分支。
+
+    格式:
+      Header (16B):
+        magic:    uint32 = _BNNW_I8_MAGIC
+        version:  uint32 = _BNNW_I8_VERSION
+        num_conv: uint32  (Conv1d 层数)
+        _rsv:     uint32 = 0
+
+      每层块:
+        Cout:   uint32
+        Cin_K:  uint32  (= Cin * K, 权重内维度)
+        nbytes: uint32  (W_i8 字节数 = Cout * Cin_K)
+        _rsv:   uint32 = 0
+        W_i8:   int8[Cout * Cin_K]   行主序, 与 F32 权重布局一致
+        [0-3 字节 4 字节对齐填充]
+        scale:  float32[Cout]        per-output-channel 量化尺度
+                                     W_f32[oc,:] ≈ W_i8[oc,:] * scale[oc]
+    对称量化 (zero_point=0), 量化公式:
+        scale[oc] = max(|W_f32[oc,:]|) / 127
+        W_i8[oc,:]= clip(round(W_f32[oc,:] / scale[oc]), -128, 127)
+    """
+    conv_layers = _collect_conv1d_layers(model)
+    num_conv = len(conv_layers)
+
+    buf = bytearray()
+    buf += struct.pack("<IIII", _BNNW_I8_MAGIC, _BNNW_I8_VERSION, num_conv, 0)
+
+    for mod in conv_layers:
+        W_f32 = mod.weight.detach().cpu().numpy().astype(np.float32)  # [Cout, Cin, K]
+        Cout   = W_f32.shape[0]
+        Cin_K  = int(np.prod(W_f32.shape[1:]))                        # Cin * K
+        W_flat = W_f32.reshape(Cout, Cin_K)                           # [Cout, Cin*K]
+
+        # per-output-channel 对称量化
+        col_max = np.abs(W_flat).max(axis=1)                           # [Cout]
+        col_max = np.where(col_max < 1e-8, 1e-8, col_max)             # 避免除零
+        scale   = (col_max / 127.0).astype(np.float32)                # [Cout]
+        W_i8    = np.clip(np.round(W_flat / scale[:, None]), -128, 127).astype(np.int8)
+
+        w_bytes = W_i8.tobytes()
+        nbytes  = len(w_bytes)
+        pad_len = (-nbytes) % 4                                        # 对齐到 4 字节
+
+        buf += struct.pack("<IIII", Cout, Cin_K, nbytes, 0)
+        buf += w_bytes
+        buf += b"\x00" * pad_len
+        buf += scale.tobytes()
+
+    return bytes(buf)
 
 
 # ---- 图 IR 段 (数据驱动建图, 与 C bnn_masknet build_graph 等价) ----
@@ -128,15 +190,19 @@ def export_model_package(model, cfg, mel_mean, mel_std,
 
     graph_ir = _masknet_graph_ir(cfg, emb_dim)
 
+    # 预先生成 INT8 权重段 (避免在 sections 列表内重复调用 model)
+    weights_i8_data = _bnnw_i8_bytes(model)
+
     # (name, dtype, shape, data_bytes)
     sections = [
-        ("config",   PKG_DT_I32, [int(config.size)],     config.tobytes()),
-        ("weights",  PKG_DT_RAW, [0],                     _bnnw_bytes(model)),
-        ("mel_mean", PKG_DT_F32, [int(mel_mean.size)],    mel_mean.tobytes()),
-        ("mel_std",  PKG_DT_F32, [int(mel_std.size)],     mel_std.tobytes()),
-        ("emb",      PKG_DT_F32, [num_inst, emb_dim],     emb.tobytes()),
-        ("names",    PKG_DT_RAW, [len(names)],            names),
-        ("graph",    PKG_DT_RAW, [len(graph_ir)],         graph_ir),   # 数据驱动建图 IR
+        ("config",      PKG_DT_I32, [int(config.size)],     config.tobytes()),
+        ("weights",     PKG_DT_RAW, [0],                     _bnnw_bytes(model)),
+        ("weights_i8",  PKG_DT_I8,  [0],                     weights_i8_data),  # INT8 量化权重
+        ("mel_mean",    PKG_DT_F32, [int(mel_mean.size)],    mel_mean.tobytes()),
+        ("mel_std",     PKG_DT_F32, [int(mel_std.size)],     mel_std.tobytes()),
+        ("emb",         PKG_DT_F32, [num_inst, emb_dim],     emb.tobytes()),
+        ("names",       PKG_DT_RAW, [len(names)],            names),
+        ("graph",       PKG_DT_RAW, [len(graph_ir)],         graph_ir),   # 数据驱动建图 IR
     ]
     n = len(sections)
     cur = 16 + n * _PKG_TOC_ENTRY

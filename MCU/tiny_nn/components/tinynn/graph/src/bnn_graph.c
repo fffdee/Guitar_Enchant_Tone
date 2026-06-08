@@ -323,3 +323,11 @@ int bnn_graph_load_weights_mem(const bnn_graph_t *g, const void *buf, size_t nby
     BNN_LOGI("loaded weights from memory (%llu floats)", n);
     return 0;
 }
+
+bnn_layer_t *bnn_graph_get_node_layer(const bnn_graph_t *g, int node_id)
+{
+    if (!g || node_id < 0 || node_id >= g->n_nodes) return NULL;
+    const node_t *nd = &g->nodes[node_id];
+    if (nd->is_input) return NULL;
+    return nd->layer;
+}

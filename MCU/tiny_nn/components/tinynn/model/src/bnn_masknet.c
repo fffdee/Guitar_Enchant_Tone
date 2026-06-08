@@ -10,6 +10,12 @@
 #include "bnn_utils/bnn_log.h"
 #include <math.h>
 #include <string.h>
+#include <stdint.h>
+#include <inttypes.h>
+
+/* INT8 权重段格式常量 (与 PC 端 export.py _BNNW_I8_MAGIC 一致) */
+#define BNNW_I8_MAGIC_VAL  0x3849574Eu
+#define BNNW_I8_VERSION_VAL 1u
 
 struct bnn_masknet {
     bnn_mask_cfg_t cfg;
@@ -36,6 +42,17 @@ struct bnn_masknet {
     float *hopbuf;        /* [hop] */
     int add_noise;
     float noise_gate_db;  /* 低于此输入帧能量则静音 (§6.5) */
+
+    /* 诊断计时 (可选, 通过 bnn_masknet_set_tick_fn 注入平台计时函数) */
+    int64_t (*tick_us)(void); /* 返回微秒的计时函数; NULL=不计时 */
+    int64_t perf_specfront_us;
+    int64_t perf_graph_us;
+    int64_t perf_synth_us;
+    int32_t perf_blocks;
+
+    /* 推理进度 (供 status 查询) */
+    int prog_frame;
+    int prog_total;
 };
 
 static int build_graph(bnn_masknet_t *m) {
@@ -140,11 +157,12 @@ bnn_masknet_t *bnn_masknet_create_ir(const bnn_mask_cfg_t *cfg, int num_instrume
     m->block_frames = block_frames;
     m->cond_dim = BNN_MASK_COND_DIM(cfg);
     m->emb_dim = cfg->emb_dim;
-    m->add_noise = 1;
+    m->add_noise = 0;          /* 默认关闭噪声注入, 避免底噪; 可用 bnn_masknet_set_add_noise 开启 */
     m->noise_gate_db = -60.0f;
 
-    m->fe = bnn_specfront_create(&m->cfg);
+    /* 先建 specsynth (mel_inv 迁入 SRAM), 再建 specfront, 避免 SRAM 被占满 */
     m->syn = bnn_specsynth_create(&m->cfg);
+    m->fe = bnn_specfront_create(&m->cfg);
     if (!m->fe || !m->syn) { BNN_LOGE("masknet: front/synth fail"); goto fail; }
     /* 优先用图 IR (数据驱动); 失败或无 IR 回退内置硬编码图 */
     int gr = -1;
@@ -161,7 +179,7 @@ bnn_masknet_t *bnn_masknet_create_ir(const bnn_mask_cfg_t *cfg, int num_instrume
     m->in1    = (float *)bnn_calloc((size_t)m->cond_dim, sizeof(float));
     m->logmel = (float *)bnn_calloc((size_t)Mn, sizeof(float));
     m->mag_blk   = (float *)bnn_calloc((size_t)T * nb, sizeof(float));
-    m->phase_blk = (float *)bnn_calloc((size_t)T * nb, sizeof(float));
+    m->phase_blk = (float *)bnn_calloc((size_t)T * nb * 2, sizeof(float)); /* cos/sin 对 */
     m->frame_tmp = (float *)bnn_calloc((size_t)cfg->n_fft, sizeof(float));
     m->mask_t  = (float *)bnn_calloc((size_t)Mn, sizeof(float));
     m->dphi_t  = (float *)bnn_calloc((size_t)cfg->phase_bands, sizeof(float));
@@ -170,6 +188,8 @@ bnn_masknet_t *bnn_masknet_create_ir(const bnn_mask_cfg_t *cfg, int num_instrume
     m->emb_cur = (float *)bnn_calloc((size_t)m->cond_dim, sizeof(float));
     if (!m->in0 || !m->in1 || !m->logmel || !m->mag_blk || !m->phase_blk || !m->frame_tmp ||
         !m->mask_t || !m->dphi_t || !m->noise_t || !m->hopbuf || !m->emb_cur) goto fail;
+
+    m->in0 = (float *)bnn_try_promote_internal(m->in0, sizeof(float) * (size_t)Mn * T);
 
     BNN_LOGI("masknet: T=%d n_mels=%d cond=%d params=%zu",
              T, Mn, m->cond_dim, bnn_graph_total_params(m->g));
@@ -249,7 +269,10 @@ static int run_block(bnn_masknet_t *m, int chunk, int *gpos, int drop, int n_aud
     memcpy(m->in1, m->emb_cur, sizeof(float) * (size_t)m->cond_dim);
     if (bnn_graph_feed_input(m->g, 0, m->in0, 1) != 0) return -1;
     if (bnn_graph_feed_input(m->g, 1, m->in1, 1) != 0) return -1;
+
+    int64_t t_g0 = m->tick_us ? m->tick_us() : 0;
     if (!bnn_graph_forward(m->g)) { BNN_LOGE("masknet: forward fail"); return -1; }
+    if (m->tick_us) m->perf_graph_us += m->tick_us() - t_g0;
 
     bnn_tensor_t *tm = bnn_graph_node_output(m->g, m->node_mask);   /* (1,n_mels,T) */
     bnn_tensor_t *tp = bnn_graph_node_output(m->g, m->node_phase);  /* (1,P,T) */
@@ -259,18 +282,33 @@ static int run_block(bnn_masknet_t *m, int chunk, int *gpos, int drop, int n_aud
     const float *pd = (const float *)tp->data;
     const float *nd = (const float *)tn->data;
 
+    int64_t t_syn0 = m->tick_us ? m->tick_us() : 0;
     for (int t = 0; t < chunk; ++t) {
         for (int i = 0; i < c->n_mels; ++i) m->mask_t[i] = md[(size_t)i * T + t];
         for (int i = 0; i < c->phase_bands; ++i) m->dphi_t[i] = pd[(size_t)i * T + t];
         for (int i = 0; i < c->noise_bands; ++i) m->noise_t[i] = nd[(size_t)i * T + t];
+
+        /* 首块第 0 帧: 打印噪声向量范围, 用于诊断底噪问题 */
+        if (m->perf_blocks == 0 && t == 0) {
+            float nmin = m->noise_t[0], nmax = m->noise_t[0], nsum = 0.0f;
+            for (int i = 0; i < c->noise_bands; ++i) {
+                float v = m->noise_t[i];
+                if (v < nmin) nmin = v;
+                if (v > nmax) nmax = v;
+                nsum += v;
+            }
+            BNN_LOGI("noise_t[%d]: min=%.3f max=%.3f mean=%.3f  add_noise=%d",
+                     c->noise_bands, nmin, nmax, nsum / c->noise_bands, m->add_noise);
+        }
+
         const float *mag = m->mag_blk + (size_t)t * nb;
-        const float *phase = m->phase_blk + (size_t)t * nb;
+        const float *phase = m->phase_blk + (size_t)t * nb * 2;
         if (bnn_specsynth_process(m->syn, mag, phase, m->mask_t, m->dphi_t, m->noise_t,
                                   m->add_noise, m->hopbuf) != 0) return -1;
         /* 噪声门: 输入帧能量过低则该 hop 静音 (§6.5) */
-        double e = 0.0;
-        for (int k = 0; k < nb; ++k) e += (double)mag[k] * mag[k];
-        float frms = (float)sqrt(e / (double)nb);
+        float e = 0.0f;
+        for (int k = 0; k < nb; ++k) e += mag[k] * mag[k];
+        float frms = sqrtf(e / (float)nb);
         if (20.0f * log10f(frms + 1e-8f) < m->noise_gate_db)
             for (int j = 0; j < hop; ++j) m->hopbuf[j] = 0.0f;
         for (int j = 0; j < hop; ++j) {
@@ -279,6 +317,8 @@ static int run_block(bnn_masknet_t *m, int chunk, int *gpos, int drop, int n_aud
         }
         *gpos += hop;
     }
+    if (m->tick_us) m->perf_synth_us += m->tick_us() - t_syn0;
+    m->perf_blocks++;
     return 0;
 }
 
@@ -294,17 +334,22 @@ int bnn_masknet_process_audio(bnn_masknet_t *m, const float *audio, int n_audio,
     int n_frames = n_audio / hop + 1;
     int gpos = 0;
     int chunk = 0;
+    m->prog_frame = 0;
+    m->prog_total = n_frames;
     memset(m->in0, 0, sizeof(float) * (size_t)Mn * T);
 
     for (int t = 0; t < n_frames; ++t) {
+        m->prog_frame = t + 1;
         /* 取该帧 n_fft 样点 (center: padded index = t*hop+i, 真实 = -drop 偏移) */
         for (int i = 0; i < n_fft; ++i) {
             int ai = t * hop + i - drop;
             m->frame_tmp[i] = (ai >= 0 && ai < n_audio) ? audio[ai] : 0.0f;
         }
+        int64_t t_fe0 = m->tick_us ? m->tick_us() : 0;
         bnn_specfront_extract(m->fe, m->frame_tmp, m->logmel,
                               m->mag_blk + (size_t)chunk * nb,
-                              m->phase_blk + (size_t)chunk * nb);
+                              m->phase_blk + (size_t)chunk * nb * 2);
+        if (m->tick_us) m->perf_specfront_us += m->tick_us() - t_fe0;
         for (int cm = 0; cm < Mn; ++cm) m->in0[(size_t)cm * T + chunk] = m->logmel[cm];
         chunk++;
 
@@ -324,4 +369,121 @@ int bnn_masknet_process_audio(bnn_masknet_t *m, const float *audio, int n_audio,
         *out_n = produced;
     }
     return 0;
+}
+
+/* ── INT8 权重加载 ────────────────────────────────────────────────────────── */
+
+static inline uint32_t rd32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+}
+
+int bnn_masknet_load_weights_i8_mem(bnn_masknet_t *m, const void *buf, size_t nbytes)
+{
+    if (!m || !m->g || !buf || nbytes < 16) return 0;  /* 静默跳过 */
+
+    const uint8_t *p   = (const uint8_t *)buf;
+    const uint8_t *end = p + nbytes;
+
+    /* 验证内部魔数 */
+    if (rd32(p) != BNNW_I8_MAGIC_VAL) {
+        BNN_LOGE("masknet i8: bad magic %08" PRIx32, rd32(p));
+        return -1;
+    }
+    if (rd32(p + 4) != BNNW_I8_VERSION_VAL) {
+        BNN_LOGE("masknet i8: unsupported version %" PRIu32, rd32(p + 4));
+        return -1;
+    }
+    uint32_t num_conv = rd32(p + 8);
+    p += 16;  /* 跳过 16B 头 */
+
+    int injected = 0;
+    int n_nodes  = bnn_graph_node_count(m->g);
+
+    /* 遍历图节点, 按拓扑顺序为 conv1d 层注入 INT8 权重 */
+    for (int ni = 0; ni < n_nodes && num_conv > 0; ++ni) {
+        bnn_layer_t *layer = bnn_graph_get_node_layer(m->g, ni);
+        if (!layer || !layer->type_name) continue;
+        if (strcmp(layer->type_name, "conv1d") != 0) continue;
+
+        /* 解析下一层块头: Cout(u32) Cin_K(u32) nbytes_w(u32) _rsv(u32) */
+        if (p + 16 > end) { BNN_LOGE("masknet i8: truncated at layer %d", injected); return -1; }
+        uint32_t Cout   = rd32(p);
+        uint32_t Cin_K  = rd32(p + 4);
+        uint32_t nbytes_w = rd32(p + 8);
+        p += 16;
+
+        /* INT8 权重 */
+        if (p + nbytes_w > end) { BNN_LOGE("masknet i8: W_i8 OOB layer %d", injected); return -1; }
+        const int8_t *W_i8 = (const int8_t *)p;
+        p += nbytes_w;
+
+        /* 4 字节对齐填充 */
+        uint32_t pad = (4u - (nbytes_w % 4u)) % 4u;
+        p += pad;
+
+        /* float32 scale [Cout] */
+        size_t scale_sz = sizeof(float) * Cout;
+        if (p + scale_sz > end) { BNN_LOGE("masknet i8: scale OOB layer %d", injected); return -1; }
+        const float *scale = (const float *)p;
+        p += scale_sz;
+
+        /* 注入到 conv1d 层 */
+        if (conv1d_set_weights_i8(layer, W_i8, scale, (int)Cout, (int)Cin_K) == 0) {
+            injected++;
+        } else {
+            BNN_LOGI("masknet i8: set_weights_i8 failed layer %d", injected);
+        }
+        num_conv--;
+    }
+
+    if (injected > 0) {
+        BNN_LOGI("masknet i8: injected %d conv1d layers", injected);
+    }
+    return injected;
+}
+
+/* ── 诊断计时 API ─────────────────────────────────────────────────────────── */
+
+void bnn_masknet_set_tick_fn(bnn_masknet_t *m, int64_t (*fn)(void))
+{
+    if (m) m->tick_us = fn;
+}
+
+void bnn_masknet_perf_reset(bnn_masknet_t *m)
+{
+    if (!m) return;
+    m->perf_specfront_us = 0;
+    m->perf_graph_us     = 0;
+    m->perf_synth_us     = 0;
+    m->perf_blocks       = 0;
+}
+
+void bnn_masknet_get_progress(const bnn_masknet_t *m, int *frame, int *total)
+{
+    if (!m) return;
+    if (frame) *frame = m->prog_frame;
+    if (total) *total = m->prog_total;
+}
+
+void bnn_masknet_perf_log(const bnn_masknet_t *m)
+{
+    if (!m || !m->tick_us) {
+        BNN_LOGI("masknet perf: 未设置计时函数, 调用 bnn_masknet_set_tick_fn()");
+        return;
+    }
+    int64_t total = m->perf_specfront_us + m->perf_graph_us + m->perf_synth_us;
+    int32_t nb    = m->perf_blocks > 0 ? m->perf_blocks : 1;
+
+    BNN_LOGI("masknet perf (%d blocks):", (int)nb);
+    BNN_LOGI("  specfront : %lld ms  (%lld ms/block)",
+             (long long)(m->perf_specfront_us / 1000),
+             (long long)(m->perf_specfront_us / 1000 / nb));
+    BNN_LOGI("  graph fwd : %lld ms  (%lld ms/block)",
+             (long long)(m->perf_graph_us / 1000),
+             (long long)(m->perf_graph_us / 1000 / nb));
+    BNN_LOGI("  specsynth : %lld ms  (%lld ms/block)",
+             (long long)(m->perf_synth_us / 1000),
+             (long long)(m->perf_synth_us / 1000 / nb));
+    BNN_LOGI("  total     : %lld ms", (long long)(total / 1000));
 }

@@ -9,6 +9,59 @@
 static const char *TAG = "model_store";
 #define TOC_ENTRY 48
 
+/* ── INT8 迭代器 ──────────────────────────────────────────────────────────── */
+
+void model_i8_iter_init(model_i8_iter_t *it, const model_pkg_t *pkg)
+{
+    memset(it, 0, sizeof(*it));
+    if (!pkg || !pkg->weights_i8 || pkg->weights_i8_size < 16) return;
+
+    const uint8_t *p = (const uint8_t *)pkg->weights_i8;
+    /* 验证内部魔数 */
+    uint32_t magic = (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+    if (magic != BNNW_I8_MAGIC) {
+        ESP_LOGW("model_store", "weights_i8 magic mismatch (got %08" PRIx32 ")", magic);
+        return;
+    }
+    uint32_t num_conv = (uint32_t)p[8] | ((uint32_t)p[9]<<8) | ((uint32_t)p[10]<<16) | ((uint32_t)p[11]<<24);
+    it->p    = p + 16;   /* 跳过 16B 头 */
+    it->end  = p + pkg->weights_i8_size;
+    it->left = num_conv;
+}
+
+int model_i8_iter_next(model_i8_iter_t *it)
+{
+    if (!it || it->left == 0 || it->p + 16 > it->end) return 0;
+
+    const uint8_t *p = it->p;
+    /* 每层块头: Cout(u32) + Cin_K(u32) + nbytes(u32) + _rsv(u32) */
+    uint32_t Cout   = (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);
+    uint32_t Cin_K  = (uint32_t)p[4]|((uint32_t)p[5]<<8)|((uint32_t)p[6]<<16)|((uint32_t)p[7]<<24);
+    uint32_t nbytes = (uint32_t)p[8]|((uint32_t)p[9]<<8)|((uint32_t)p[10]<<16)|((uint32_t)p[11]<<24);
+    p += 16;
+
+    /* INT8 权重 */
+    if (p + nbytes > it->end) return 0;
+    it->W_i8  = (const int8_t *)p;
+    it->Cout  = Cout;
+    it->Cin_K = Cin_K;
+    p += nbytes;
+
+    /* 4 字节对齐填充 */
+    uint32_t pad = (4 - (nbytes % 4)) % 4;
+    p += pad;
+
+    /* float32 scale [Cout] */
+    size_t scale_sz = sizeof(float) * Cout;
+    if (p + scale_sz > it->end) return 0;
+    it->scale = (const float *)p;
+    p += scale_sz;
+
+    it->p = p;
+    it->left--;
+    return 1;
+}
+
 static uint32_t rd_u32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
@@ -45,20 +98,22 @@ esp_err_t model_store_load(const char *path, model_pkg_t *pkg)
         uint32_t doff = rd_u32(e + 40), dnb = rd_u32(e + 44);
         if (doff + dnb > (size_t)sz) { ESP_LOGW(TAG, "section %s OOB", name); off += TOC_ENTRY; continue; }
         const uint8_t *d = buf + doff;
-        if (!strcmp(name, "config"))      { pkg->config = (const int32_t *)d; pkg->config_n = (int)s0; }
-        else if (!strcmp(name, "weights")){ pkg->weights = d; pkg->weights_size = dnb; }
-        else if (!strcmp(name, "mel_mean")){ pkg->mel_mean = (const float *)d; pkg->mel_n = (int)s0; }
-        else if (!strcmp(name, "mel_std")) { pkg->mel_std = (const float *)d; }
-        else if (!strcmp(name, "emb"))     { pkg->emb = (const float *)d; pkg->num_inst = (int)s0; pkg->emb_dim = (int)(ndim >= 2 ? s1 : 0); }
-        else if (!strcmp(name, "names"))   { pkg->names = (const char *)d; pkg->names_len = (int)dnb; }
-        else if (!strcmp(name, "graph"))   { pkg->graph_ir = d; pkg->graph_ir_size = dnb; }
+        if (!strcmp(name, "config"))           { pkg->config = (const int32_t *)d; pkg->config_n = (int)s0; }
+        else if (!strcmp(name, "weights"))     { pkg->weights = d; pkg->weights_size = dnb; }
+        else if (!strcmp(name, "weights_i8"))  { pkg->weights_i8 = d; pkg->weights_i8_size = dnb; }
+        else if (!strcmp(name, "mel_mean"))    { pkg->mel_mean = (const float *)d; pkg->mel_n = (int)s0; }
+        else if (!strcmp(name, "mel_std"))     { pkg->mel_std = (const float *)d; }
+        else if (!strcmp(name, "emb"))         { pkg->emb = (const float *)d; pkg->num_inst = (int)s0; pkg->emb_dim = (int)(ndim >= 2 ? s1 : 0); }
+        else if (!strcmp(name, "names"))       { pkg->names = (const char *)d; pkg->names_len = (int)dnb; }
+        else if (!strcmp(name, "graph"))       { pkg->graph_ir = d; pkg->graph_ir_size = dnb; }
         off += TOC_ENTRY;
     }
     if (!pkg->weights || !pkg->mel_mean || !pkg->mel_std || !pkg->emb) {
         ESP_LOGE(TAG, "missing required section"); model_store_free(pkg); return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "loaded %s ver=%" PRIu32 ": weights=%zuB N=%d E=%d mel=%d",
-             path, ver, pkg->weights_size, pkg->num_inst, pkg->emb_dim, pkg->mel_n);
+    ESP_LOGI(TAG, "loaded %s ver=%" PRIu32 ": weights=%zuB i8=%zuB N=%d E=%d mel=%d",
+             path, ver, pkg->weights_size, pkg->weights_i8_size,
+             pkg->num_inst, pkg->emb_dim, pkg->mel_n);
     return ESP_OK;
 }
 

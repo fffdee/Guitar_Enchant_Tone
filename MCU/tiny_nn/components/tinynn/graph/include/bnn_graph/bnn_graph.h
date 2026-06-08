@@ -65,6 +65,9 @@ bnn_tensor_t *bnn_graph_node_output(const bnn_graph_t *g, int node_id);
 /* 一次性参数总数 (float 个数) */
 size_t bnn_graph_total_params(const bnn_graph_t *g);
 
+/* 取某节点的 layer 指针 (input 节点返回 NULL). node_id 越界或 g 为 NULL 也返回 NULL. */
+bnn_layer_t *bnn_graph_get_node_layer(const bnn_graph_t *g, int node_id);
+
 /* 保存 / 加载所有可训练参数 (按图拓扑顺序、layer 内部顺序). 简易二进制:
  *   magic(4)='BNNW' | version(u32)=1 | num_params(u64) | floats... */
 int bnn_graph_save_weights(const bnn_graph_t *g, const char *path);

@@ -21,7 +21,8 @@ void             bnn_specfront_destroy(bnn_specfront_t *fe);
 /* 设定梅尔标准化 mean/std (各 n_mels). 不调用则不标准化 (mean=0,std=1). */
 void bnn_specfront_set_norm(bnn_specfront_t *fe, const float *mel_mean, const float *mel_std);
 
-/* 提取单帧: frame 长度 = n_fft. logmel[n_mels]/mag[n_bins]/phase[n_bins] 任一可为 NULL. */
+/* 提取单帧: frame 长度 = n_fft. logmel[n_mels]/mag[n_bins] 任一可为 NULL.
+ * phase 若非 NULL, 需 2*n_bins 浮点, 存单位相位 (cos,sin) 交错. */
 void bnn_specfront_extract(bnn_specfront_t *fe, const float *frame,
                            float *logmel, float *mag, float *phase);
 

@@ -3,6 +3,7 @@
 
 #include "bnn_frontend/bnn_mask_config.h"
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,6 +34,15 @@ void           bnn_masknet_destroy(bnn_masknet_t *m);
 /* 加载网络权重 (BNNW; 顺序由 Python export_masknet_weights 保证). 返回 0 成功. */
 int  bnn_masknet_load_weights_mem(bnn_masknet_t *m, const void *buf, size_t nbytes);
 
+/*
+ * 加载 INT8 量化权重 (由 model_store.weights_i8 段提供).
+ * 内部迭代图节点, 对每个 conv1d 层调用 conv1d_set_weights_i8.
+ * 需先调用 bnn_masknet_load_weights_mem 完成 F32 权重加载.
+ * 若 buf=NULL 或目标芯片未定义 BNN_CONV1D_INT8_ACCEL, 静默返回 0.
+ * 返回成功注入的层数 (≥0) 或 -1 (解析错误).
+ */
+int  bnn_masknet_load_weights_i8_mem(bnn_masknet_t *m, const void *buf, size_t nbytes);
+
 /* 梅尔标准化 mean/std (各 n_mels). */
 void bnn_masknet_set_mel_norm(bnn_masknet_t *m, const float *mean, const float *std);
 
@@ -56,6 +66,15 @@ int  bnn_masknet_process_audio(bnn_masknet_t *m, const float *audio, int n_audio
 
 size_t bnn_masknet_num_params(const bnn_masknet_t *m);
 int    bnn_masknet_block_frames(const bnn_masknet_t *m);
+
+/* ── 诊断计时 API ─────────────────────────────────────────────────────────
+ * 注入返回微秒的计时函数 (MCU 侧用 esp_timer_get_time), 不注入则计时为 0.
+ * bnn_masknet_perf_reset: 清零计数器 (inference 开始前调用).
+ * bnn_masknet_perf_log:   用 bnn_log 打印 specfront/graph/synth/other 分段耗时. */
+void bnn_masknet_set_tick_fn(bnn_masknet_t *m, int64_t (*fn)(void));
+void bnn_masknet_perf_reset(bnn_masknet_t *m);
+void bnn_masknet_perf_log(const bnn_masknet_t *m);
+void bnn_masknet_get_progress(const bnn_masknet_t *m, int *frame, int *total);
 
 #ifdef __cplusplus
 }

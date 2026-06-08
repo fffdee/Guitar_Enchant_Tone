@@ -38,6 +38,13 @@ void   bnn_ws_reset(bnn_workspace_t *ws);
 size_t bnn_ws_used(bnn_workspace_t *ws);
 size_t bnn_ws_peak(bnn_workspace_t *ws);
 
+/*
+ * 将 workspace 绑定到外部缓冲区 (不归 workspace 所有, 不自动扩容).
+ * MCU 场景: 用 heap_caps_aligned_alloc(16, size, MALLOC_CAP_INTERNAL) 在
+ * 内部 SRAM 分配, 确保 conv1d col/tmp 缓冲在快速 SRAM 而非慢速 PSRAM.
+ */
+void bnn_ws_assign_buf(bnn_workspace_t *ws, void *buf, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

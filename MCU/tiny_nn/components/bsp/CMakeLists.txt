@@ -12,6 +12,7 @@ idf_component_register(
         "05_component/wav.c"
         "05_component/model_store.c"
         "05_component/dsp_accel.c"
+        "05_component/nn_accel.c"
         "05_component/audio_post.c"
         "06_app/audio_xform.c"
         "06_app/infer_worker.c"
@@ -23,7 +24,8 @@ idf_component_register(
         "05_component"
         "06_app"
     REQUIRES
-        tinynn fatfs sdmmc esp_driver_sdmmc vfs driver esp_psram esp_timer espressif__esp-dsp console
+        tinynn fatfs sdmmc esp_driver_sdmmc vfs driver esp_psram esp_timer
+        espressif__esp-dsp espressif__esp-nn console
 )
 
 # 把 -Werror=format 降为警告 (uint32_t=long unsigned int 在 xtensa/riscv 工具链差异)
