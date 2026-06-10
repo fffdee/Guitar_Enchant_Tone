@@ -1,10 +1,12 @@
 # 复音吉他实时音色转换 —— 完整实现文档
 
-本文档给出"用吉他演奏(含和弦/复音)实时转换为其他乐器音色"系统的完整实现方案,覆盖:训练数据采集(Ample Sound + FL Studio)、数据预处理、模型结构、训练、量化导出、ESP32-P4 实时部署、失真效果器与双模切换、评估与落地路线。
+本文档给出"用吉他演奏(含和弦/复音)实时转换为其他乐器音色"系统的完整实现方案,覆盖:训练数据采集(Ample Sound + Reaper)、数据预处理、模型结构、训练、量化导出、ESP32-P4 实时部署、失真效果器与双模切换、评估与落地路线。
 
 核心技术路线:不做基频(F0)估计,改用**频域条件谱映射**——对输入吉他做 STFT,用条件 CNN(FiLM + 乐器嵌入)预测**频谱增益掩码**,作用在输入幅度谱上,复用输入相位做 IFFT 重建。该路线天然支持复音(和弦),且在 MCU 上算力与同时发声音符数无关。
 
 默认参数(全文统一):采样率 48kHz、单声道、STFT 窗长 1024、帧移 256、Hann 窗、线性谱 513 bin、对数梅尔 96 维、乐器嵌入 16 维、掩码上限 Gmax=4.0、相位残差 64 带(上限 π/2)、噪声 16 带。
+
+> **当前实现状态(ESP32-P4 固件)**:本文档的 §0–§9 描述完整的设计目标与方案。§14 详细记录 ESP32-P4 端实际已实现的代码级逻辑，包括每一步数学推导、数据结构、稀疏优化与内存布局——这是理解"模型输出如何变成音频"的关键章节。
 
 ---
 
@@ -13,9 +15,9 @@
 ```mermaid
 flowchart TD
     subgraph OFF[离线 训练]
-        M[MIDI 素材库] --> FL[FL Studio 工程]
-        FL --> G[Ample Sound 渲染吉他<br/>输入数据]
-        FL --> T[其他乐器渲染<br/>输出标签]
+        M[MIDI 素材库] --> RP[Reaper 工程<br/>Reaper-MCP 自动化]
+        RP --> G[Ample Sound 渲染吉他<br/>输入数据]
+        RP --> T[其他乐器渲染<br/>输出标签]
         G --> PRE[预处理 STFT 梅尔]
         T --> PRE
         PRE --> DS[配对数据集]
@@ -36,26 +38,28 @@ flowchart TD
 
 ---
 
-## 1. 训练数据采集(Ample Sound + FL Studio)
+## 1. 训练数据采集(Ample Sound + Reaper)
 
 这是整个项目质量的地基。核心目标:**对同一段 MIDI,渲染出"严格时间对齐"的两路(或多路)音频——吉他(Ample Sound,作为输入)与目标乐器(作为输出标签)**。下面给出从素材设计到导出的完整流程与必须遵守的规则。
+
+当前工程使用 **Reaper DAW** 进行数据采集,并通过 **Reaper-MCP**（`Reaper-MCP/` 目录）实现 AI 辅助自动化控制。详细操作见附录 C。
 
 ### 1.1 总原则(必须满足)
 
 - **同一份 MIDI**:输入吉他与目标乐器必须由完全相同的 MIDI 音符驱动(同样的音高、起始时间、时长、力度)。
-- **样本级对齐**:两路音频要逐帧对齐。最可靠的做法是在**一次渲染中用"拆分混音轨"导出**(见 1.5),由 FL Studio 统一做插件延迟补偿(PDC),保证起点一致、长度一致。
+- **样本级对齐**:两路音频要逐帧对齐。最可靠的做法是在 Reaper 中用 **"Stems (selected tracks)"** 渲染模式一次性导出全部轨道,Reaper 统一做插件延迟补偿(PDC),保证起点一致、长度一致。
 - **统一格式**:48000 Hz、单声道、24-bit 或 32-bit float WAV。
 - **干信号**:关闭所有混响/EQ/压缩/限制器/母带效果。我们要的是裸音色。
 - **关闭时间随机化**:Ample Sound 的"人性化/humanize"、随机起音、Strummer 自动扫弦位移等会让吉他音符偏离 MIDI 网格,导致与目标乐器**错位**。必须关闭这些时间扰动,让吉他严格按 MIDI 发声。音色层面的轮替采样(round-robin)可以保留。
 - **电平一致**:关闭逐文件归一化(normalize)。各路保持一致的绝对电平,这样模型才能正确学习响度映射。
 
-### 1.2 工程基础设置(FL Studio)
+### 1.2 工程基础设置(Reaper)
 
-1. 采样率设为 48kHz:Options 1 > Audio Settings(导出时也在 Export 对话框确认 48000 Hz)。
-2. 固定工程速度(如 120 BPM,实际数值不影响,只要两路同速)。
-3. 关闭主输出(Master)上的所有效果器与限制器。
+1. 采样率设为 48kHz:`File → Project settings → Audio → Sample rate: 48000`(或 `Alt+Enter` 打开工程设置)。
+2. 固定工程速度(如 120 BPM,在 Tempo 栏设置)。
+3. 不在 Master 轨添加任何效果器(EQ/限制器/母带链保持空)。
 4. 关闭 Ample Sound 内置的混响/箱体/效果,使用干净 DI 输出;关闭其 Humanize、随机力度/时间、Strummer 的时间位移。
-5. 目标乐器同样关闭自带的混响/效果,输出干信号;尽量将其设为单声道或居中,便于后续统一下混为单声道。
+5. 目标乐器同样关闭自带的混响/效果,输出干信号;在轨道属性里设为单声道(Mono),便于后续下混。
 
 ### 1.3 MIDI 素材设计(决定泛化能力)
 
@@ -72,25 +76,37 @@ flowchart TD
 
 > 演奏法标签(用于"演奏法嵌入",见 §3):采集时**记录每段/每音的 articulation/keyswitch 标签**(可从 MIDI 的 keyswitch 读出),写入 `meta.json`。若不使用演奏法嵌入可忽略,模型条件向量退化为仅乐器嵌入。
 
-### 1.4 通道路由:让两路共享同一 MIDI
+### 1.4 轨道路由:让多轨共享同一 MIDI
 
-目标:Ample Sound 通道与目标乐器通道接收**完全相同**的音符。
+目标:Guitar 轨与目标乐器轨接收**完全相同**的音符。
 
-- 在 Channel Rack 放入 Ample Sound 通道,写好钢琴卷帘(Piano Roll)音符。
-- 复制该通道(右键 > Clone),把复制体的乐器替换为目标乐器 VST(FLEX / Sytrust / DirectWave / 第三方采样库等)。复制保证两者音符逐一相同。
-- 将 Ample Sound 通道路由到混音器 Insert 1,目标乐器通道路由到 Insert 2(每个目标乐器各占一个 Insert)。
-- 若要一次性渲染多个目标乐器:为每个目标乐器再克隆一个通道、各自占一个 Insert,全部由同一组音符驱动。
+**推荐方案——复制 MIDI Item**（最简单可靠）:
+- 在 Guitar 轨创建 MIDI item,在钢琴卷帘里写好音符。
+- 为每个目标乐器创建新轨并插入对应 VSTi(如 Ample Bass)。
+- 复制 Guitar 轨的 MIDI item,粘贴到每个目标乐器轨上,**确保起始位置完全一致**。
+- 复制操作：选中 MIDI item → `Ctrl+D`(复制到同一位置)→ 拖到目标轨。
 
-### 1.5 导出(保证样本级对齐的关键)
+**可选方案——MIDI 路由**（减少重复操作,适合多目标乐器）:
+- 在 Reaper 中可将一个轨道的 MIDI 输出发送到多条轨道（Track Routing → 勾选 "Send MIDI to" 目标轨），这样只需维护一份 MIDI 内容。
 
-推荐用"拆分混音轨"一次性导出所有对齐音频:
+若要一次性渲染多个目标乐器:每个目标乐器各占一条轨道,全部由同一 MIDI 内容驱动。
 
-1. File > Export > WAV file。
-2. 勾选 **Split mixer tracks**(拆分混音轨):FL Studio 会为每个有信号的 Insert 各导出一个 WAV,且全部由同一渲染过程产生、做了统一 PDC,**起点与长度天然一致**。
-3. 导出设置:48000 Hz;位深 24-bit 或 32-bit float;**关闭 Normalize**;启用 **Tail / Leave remainder**(保留尾音,避免释音被切断);Resampling 选高质量(如 Sinc)。
-4. 结果:同一片段得到 `Insert1=guitar.wav`、`Insert2=<目标乐器>.wav` …,逐帧对齐。
+### 1.5 渲染(保证样本级对齐的关键)
 
-若因故必须分别单独渲染(不推荐),务必:同一工程、同一片段、同一起止位置、同样开启 Tail,渲染后用互相关校验起点偏移并对齐(见第 2 章)。
+推荐用 Reaper 的"**Stems (selected tracks)**"模式一次性导出所有对齐音频（原理等价于"逐轨单独渲染但统一 PDC"）:
+
+1. 选中所有需要导出的轨道(Guitar + 全部目标乐器轨)。
+2. `File → Render` (或 `Ctrl+Alt+R`) 打开渲染对话框。
+3. 关键设置:
+   - **Render mode**: `Selected tracks (stems)` — Reaper 会为每条选中轨道分别渲染一个 WAV,统一 PDC,**起点与长度天然一致**。
+   - **Sample rate**: 48000 Hz。
+   - **Channels**: Mono(或根据 VSTi 输出选 Stereo,后处理阶段再下混)。
+   - **Bit depth**: 24-bit PCM 或 32-bit float。
+   - **关闭 Normalize**:不勾选任何 normalize/limit 选项。
+   - **Add tail of N seconds**:建议 2~4 秒,保留尾音/释音,避免截断。
+4. 在 "Output file" 中设置命名规则,例如 `$track`（按轨道名命名），结果自动得到 `guitar.wav`、`bass.wav` 等,逐帧对齐。
+
+若因故必须分别单独渲染(不推荐),务必:同一工程、同一片段、同一起止范围,渲染后用互相关校验起点偏移并对齐(见第 2 章)。
 
 ### 1.6 单声道与电平处理
 
@@ -128,14 +144,14 @@ dataset/
 
 ### 1.9 数据采集检查清单(逐条核对)
 
-- [ ] 工程与导出均为 48kHz。
-- [ ] 两路由同一 MIDI(克隆通道)驱动。
+- [ ] 工程与导出均为 48kHz（File → Project Settings → Audio → Sample rate）。
+- [ ] 所有轨道由同一 MIDI 内容驱动（复制 MIDI item 或 MIDI 路由）。
 - [ ] 关闭 Humanize / 随机时间 / Strummer 时间位移。
-- [ ] 关闭所有混响/EQ/压缩/限制器/母带效果(吉他与目标乐器都干信号)。
-- [ ] 用 Split mixer tracks 一次性导出,保证对齐。
-- [ ] 关闭 Normalize,保留尾音(Tail)。
-- [ ] 单声道(或统一下混),电平一致。
-- [ ] 和弦/复音样本比例足够。
+- [ ] 关闭所有混响/EQ/压缩/限制器/母带效果（吉他与目标乐器都干信号；Master 轨无效果链）。
+- [ ] 用 "Stems (selected tracks)" 模式一次性导出,保证对齐。
+- [ ] 关闭 Normalize,添加 Tail（2~4 秒）保留尾音。
+- [ ] 单声道（或统一下混）,电平一致。
+- [ ] 和弦/复音样本比例足够（>40%）。
 
 ---
 
@@ -704,6 +720,853 @@ poly-timbre-transfer/
 
 ---
 
+## 14. ESP32-P4 实际实现：完整音频合成流水线详解
+
+本章是对 §5/§6 设计意图的**代码级落地说明**，聚焦于"模型三个输出头的数值如何一步步变成音频样点"。所有细节均来自 `MCU/tiny_nn/components/tinynn/` 目录下的实际 C 实现。
+
+### 14.1 整体架构：tinynn 自研推理框架
+
+ESP32-P4 端不使用 TFLite Micro，而是自研了一套轻量 C 推理框架 **tinynn**，原因是对内存布局、算子调度、稀疏优化有更高的定制需求。
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     bnn_masknet  (编排层)                            │
+│  bnn_specfront_t       bnn_graph_t         bnn_specsynth_t          │
+│  (音频前端)             (计算图推理)           (音频合成)               │
+└──────┬────────────────────────┬──────────────────────┬──────────────┘
+       │                        │                      │
+  bnn_dsp_backend          算子后端                bnn_dsp_backend
+  ESP-DSP RFFT           CPU/DSP/NN            ESP-DSP IRFFT
+  稀疏梅尔滤波          INT8 Conv1d加速          稀疏矩阵 OLA
+```
+
+关键设计原则：
+- **算子可替换**：GEMM、Conv1d 等算子通过虚函数表（`bnn_op_backend_t`, `bnn_nn_backend_t`）分发，可在 CPU/ESP-DSP/ESP-NN 间切换。
+- **SRAM 优先**：所有热数据（稀疏索引、权重、工作缓冲）尽量从 PSRAM 促入内部 SRAM（`bnn_try_promote_internal`）。
+- **块处理**：每次推理积累 T=64 帧（≈342ms），一次前向传播，再逐帧合成。
+
+---
+
+### 14.2 阶段一：音频前端（bnn_specfront）
+
+**作用**：把原始 PCM 音频帧变成神经网络的输入 `logmel[96]`，同时保存后续合成所需的 `mag[513]` 和 `phase[513×2]`。
+
+#### 14.2.1 加窗与 RFFT
+
+```c
+// bnn_specfront_extract() 核心逻辑
+for (int i = 0; i < n_fft; ++i)
+    fe->in_buf[i] = frame[i] * fe->window[i];   // Hann 加窗
+dsp->rfft(fe->in_buf, fe->cplx, n_fft);          // ESP-DSP 实数 FFT
+```
+
+- 输入：`frame[1024]`，来自 PCM 环形缓冲，每帧步进 `hop=256` 点（75% 重叠）。
+- Hann 窗系数 `window[k] = 0.5 - 0.5·cos(2π·k/n_fft)`，离线预算，存 SRAM。
+- RFFT 输出：`cplx[2×513]`，以交错格式存储实部/虚部 `[re0, im0, re1, im1, ...]`。
+
+#### 14.2.2 幅度谱与单位相位
+
+```c
+for (int k = 0; k < n_bins; ++k) {
+    float re = cplx[2*k], im = cplx[2*k+1];
+    float m = sqrtf(re*re + im*im);
+    mag[k] = m;                                   // 幅度谱 [513]
+    float inv = m > 1e-8f ? (1.0f / m) : 0.0f;
+    phase[2*k]   = re * inv;                      // cos(φ)
+    phase[2*k+1] = im * inv;                      // sin(φ)
+}
+```
+
+关键优化：**不存 `atan2(im, re)` 角度，而是存 `(cosφ, sinφ)` 单位向量**。这样合成时的相位旋转只需复数乘法，无需 `sincosf` 调用（节省约 400 cycle/bin）。
+
+#### 14.2.3 稀疏梅尔滤波器组
+
+梅尔滤波器组 `Mel[96×513]` 是三角形的：每个频率 bin（列）最多只与 2 个相邻梅尔通道（行）有非零权重。
+
+**稠密方案**（未使用）：
+```
+logmel[m] = Σ_k Mel[m,k] × mag[k]    // 193KB PSRAM 矩阵 + 49248 MAC/帧
+```
+
+**稀疏方案**（实际实现）：
+```c
+// 预处理：把 193KB 矩阵压缩为 4 个 513-元素数组（约 6KB）
+mel_sp_i0[k], mel_sp_i1[k]  // 第 k 个 bin 贡献的梅尔通道索引
+mel_sp_w0[k], mel_sp_w1[k]  // 对应权重
+
+// 运行时：scatter-accumulate，1026 MAC/帧
+memset(logmel, 0, n_mels * sizeof(float));
+for (int k = 0; k < n_bins; ++k) {
+    float v = mag[k];
+    logmel[mel_sp_i0[k]] += mel_sp_w0[k] * v;
+    logmel[mel_sp_i1[k]] += mel_sp_w1[k] * v;  // w1=0时贡献为0
+}
+```
+
+效果：**193KB PSRAM 读 + 49248 MAC → 6KB SRAM 访问 + 1026 MAC**，速度约快 48 倍。
+
+#### 14.2.4 对数压缩与归一化
+
+```c
+for (int m = 0; m < n_mels; ++m) {
+    float lm = logf(logmel[m] + 1e-5f);            // 对数压缩
+    logmel[m] = (lm - mel_mean[m]) / mel_std[m];   // 标准化
+}
+```
+
+`mel_mean[96]` 和 `mel_std[96]` 从训练集统计，存储在 `xform_model.bin` 中，启动时加载。
+
+**阶段一输出**（每帧）：
+- `logmel[96]`：神经网络输入
+- `mag[513]`：合成阶段用于恢复幅度
+- `phase[513×2]`：合成阶段用于复数旋转
+
+---
+
+### 14.3 阶段二：神经网络推理（bnn_graph / MaskNet）
+
+#### 14.3.1 块处理机制
+
+模型以 **T=64 帧为一块** 批量推理（权衡延迟与内存）：
+
+```c
+// bnn_masknet_process() 的工作方式
+// 积累 64 帧后一次前向，再逐帧合成
+for each incoming frame:
+    store logmel[96]  → in0 accumulation buffer [96, T]
+    store mag[513]    → mag_blk [513, T]
+    store phase[1026] → phase_blk [1026, T]
+
+when T frames accumulated:
+    bnn_graph_forward() → mask[96,T], dphi[64,T], noise[16,T]
+    for t in 0..T-1:
+        bnn_specsynth_process(mag_blk[t], phase_blk[t],
+                              mask[t], dphi[t], noise[t])
+        → out_hop[256]
+```
+
+#### 14.3.2 网络结构与数据流
+
+```
+输入: logmel[96, T=64]     乐器嵌入: emb_cur[16]
+                │                        │
+           ┌────▼────┐             ┌─────▼─────┐
+           │  Conv1d  │             │  FiLM-1   │
+           │ 96→128   │◄────────────│ cond→γ,β  │
+           │ k=3,p=1  │             └───────────┘
+           │  + ReLU  │
+           └────┬────┘
+                │ [128, T]
+           ┌────▼────┐             ┌─────────────┐
+           │  Conv1d  │             │   FiLM-2    │
+           │ 128→128  │◄────────────│ cond→γ,β   │
+           │ k=3,d=2  │             └─────────────┘
+           │  + ReLU  │
+           └────┬────┘
+                │ [128, T]
+           ┌────▼────┐
+           │  Conv1d  │
+           │ 128→96   │
+           │ k=3,p=1  │
+           │  + ReLU  │
+           └────┬────┘
+                │ 主干特征 [96, T]
+         ┌──────┼──────────────┐
+         ▼      ▼              ▼
+   ┌──────────┐ ┌──────────┐ ┌──────────┐
+   │ 掩码头   │ │ 相位头   │ │ 噪声头   │
+   │ Conv1d   │ │ Conv1d   │ │ Conv1d   │
+   │ 96→96,k1 │ │ 96→64,k1 │ │ 96→16,k1 │
+   └────┬─────┘ └────┬─────┘ └────┬─────┘
+        │            │            │
+   sigmoid×4.0   tanh×(π/2)   softplus
+        │            │            │
+   mask[96,T]   dphi[64,T]   noise[16,T]
+   值域[0,4.0]  值域[-π/2,π/2]  值域[0,+∞)
+```
+
+- **FiLM 调制**：`h' = γ·h + β`，其中 `γ`、`β` 由乐器嵌入经全连接层生成（`emb[16] → FC → [256]` → 切成各 128 维的 `γ`/`β`）。不同乐器嵌入会生成截然不同的调制参数，从而改变网络对频谱的变换方式。
+- **INT8 加速**：`conv1d`(dilation=1) 层权重量化为 INT8，由 ESP-NN 硬件加速。dilation=2 层保持 F32（ESP-NN 当前不支持非1膨胀）。
+- **计算图执行**：权重从 `xform_model.bin` 加载，通过图 IR 段自动建图（无硬编码拓扑）。
+
+#### 14.3.3 三个输出头的物理意义
+
+| 输出 | 形状 | 激活 | 物理含义 |
+|---|---|---|---|
+| `mask` | [96, T] | sigmoid × 4.0 | 每个梅尔频带的增益系数（音色主体）。1.0=保持，>1.0=增强，<1.0=压制 |
+| `dphi` | [64, T] | tanh × π/2 | 64 个低分辨率频带的相位残差（去除吉他音色味道、修正群延迟） |
+| `noise` | [16, T] | softplus | 16 个噪声频带的增益（合成无谐波成分：拨片、击弦、气息等瞬态） |
+
+---
+
+### 14.4 阶段三：频域合成（bnn_specsynth）
+
+**这是最核心的部分**：把神经网络每帧输出的 `mask[96]`、`dphi[64]`、`noise[16]` 与前端保存的 `mag[513]`、`phase[1026]` 结合，重建目标乐器的复数频谱，再 IRFFT + OLA 得到音频。
+
+完整流程如下：
+
+```
+     mask[96]     mag[513]    phase[1026]    dphi[64]    noise[16]
+        │              │            │             │            │
+        ▼              │            │             ▼            │
+ 稀疏 mel_inv          │            │      稀疏 phase_inv      │
+ (2次乘加/bin)         │            │      (2次乘加/bin)       │
+        │              │            │             │            │
+        ▼              │            │             ▼            │
+   gain[513]           │            │         dp[513]          │
+        │              │            │             │            │
+        └──────────────┤            │             │            │
+                       ▼            │             │            │
+                   ylin=gain×mag    │             │            │
+                                    │             │            │
+                    复数旋转  ◄──────┘             │            │
+            re = ylin×(cosφ·cosdp − sinφ·sindp)  │            │
+            im = ylin×(cosφ·sindp + sinφ·cosdp)  │            │
+                         ▲                        │            │
+                         └──────────────── dp ────┘            │
+                                                               │
+                             (可选) 噪声注入  ◄─────────────────┘
+                         noise_shape = noise_fb_T × noise[16]
+                         (nr,ni) = Marsaglia 随机单位向量
+                         re += noise_shape × nr
+                         im += noise_shape × ni
+                                    │
+                                    ▼
+                               IRFFT [1024]
+                                    │
+                              Hann 加窗 OLA
+                                    │
+                               out_hop[256]
+```
+
+#### 14.4.1 步骤 1：稀疏 mel_inv（96维掩码 → 513维增益）
+
+**问题**：神经网络输出 `mask[96]`（梅尔域），但 IFFT 需要 513 个频率 bin 的增益。需要把梅尔域掩码"展开"回线性频率域。
+
+**展开矩阵** `mel_inv[513×96]`：由梅尔滤波器组转置归一化得到（见 §5.1）。与梅尔滤波器一样，这个矩阵也继承三角滤波器的稀疏性：每一行（每个线性 bin）**最多只有 2 个非零元素**（对应该 bin 所在的至多 2 个梅尔通道）。
+
+**稀疏表示**（4 × 513 个元素，约 5KB）：
+
+```c
+// 离线构建（bnn_specsynth_create）
+for (int r = 0; r < n_bins; ++r) {
+    // 找 mel_inv 第r行中至多2个非零元素
+    mel_inv_i0[r], mel_inv_w0[r] = 第1个非零的 mel 索引和权重
+    mel_inv_i1[r], mel_inv_w1[r] = 第2个非零（若只有1个，则 w1=0）
+}
+bnn_free(mel_inv);  // 释放 193KB
+
+// 运行时（每帧，每bin 2次乘加）
+float g = mel_inv_w0[r] * mask[mel_inv_i0[r]]
+        + mel_inv_w1[r] * mask[mel_inv_i1[r]];
+```
+
+效果：**193KB PSRAM + 96次乘加/bin → 5KB SRAM + 2次乘加/bin**。
+
+#### 14.4.2 步骤 2：增益平滑
+
+帧间一阶平滑，抑制掩码抖动导致的"水声/musical noise"：
+
+```c
+float gain = g;
+if (have_prev && smooth_a > 0.0f)
+    gain = smooth_a * gain_prev[r] + (1.0f - smooth_a) * gain;
+gain_prev[r] = gain;
+// smooth_a = 0.5（默认），可通过 bnn_masknet_set_smooth() 调整
+```
+
+#### 14.4.3 步骤 3：稀疏 phase_inv（64维相位残差 → 513维）
+
+**问题**：网络输出 `dphi[64]`（64 个低分辨率相位残差带），需插值到 513 个 bin。
+
+**插值矩阵** `phase_inv[513×64]`：线性插值矩阵，每行**精确只有 2 个非零元素**（相邻两个低分辨率带的插值权重，两者之和为 1）。
+
+```c
+// 稀疏形式（2 × 513个元素，约 5KB）
+float dp = phase_sp_w0[r] * dphi[phase_sp_i0[r]]
+         + phase_sp_w1[r] * dphi[phase_sp_i1[r]];
+```
+
+效果：**128KB PSRAM + 64次条件判断/bin → 5KB SRAM + 2次乘加/bin**。
+
+#### 14.4.4 步骤 4：复数旋转重建频谱
+
+这是核心的复数乘法。设第 `r` 个频率 bin：
+
+```
+输入吉他复数谱: (cosφ, sinφ) = phase[2r], phase[2r+1]  （已在前端归一化）
+增益: ylin = gain × mag[r]
+相位旋转量: dp（由 dphi 展开得到）
+```
+
+复数旋转 `Y = ylin × e^{j(φ + dp)}`，展开：
+
+```
+e^{j(φ+dp)} = cosφ·cosdp - sinφ·sindp  +  j(cosφ·sindp + sinφ·cosdp)
+```
+
+代码：
+
+```c
+float ylin = gain * mag[r];
+float pc = phase[2*r], ps = phase[2*r+1];   // cosφ, sinφ
+float cd, sd;
+sincosf(dp, &sd, &cd);                       // cosdp, sindp
+float re = ylin * (pc*cd - ps*sd);
+float im = ylin * (pc*sd + ps*cd);
+```
+
+**物理意义**：
+- `gain × mag[r]`：把吉他的幅度谱乘上网络预测的增益，重塑频谱包络（即音色）。
+- 相位旋转 `dp`：在保留吉他原始相位的基础上，叠加一个有界的残差。这能去除吉他特有的群延迟着色，使音色更接近目标乐器。
+- 由于 `gain` 是纯实数增益（非负），**音高梳状结构被完整保留**，因此和弦中的所有音高分量均不受影响——这是该方法天然支持复音的根本原因。
+
+#### 14.4.5 步骤 5（可选）：噪声注入
+
+目的：补充吉他到目标乐器之间无谐波的宽带成分（拨片噪声、击弦瞬态、气息等）。默认**关闭**（`add_noise=0`），可用 CLI 命令 `-N` 开启。
+
+**子步骤 5a：噪声形状预算（批量 GEMV）**
+
+```
+网络输出 noise[16]（16个噪声频带的增益）
+noise_fb_T[513×16]（噪声频带滤波器组的转置）
+
+noise_shape[r] = Σ_b  noise_fb_T[r, b] × noise[b]  (r=0..512)
+```
+
+`noise_fb_T` 是从 `mel_basis[16×513]` 转置而来：
+- 原始：按行主序读 `mel_basis[b × 513 + r]`，步长 2052 字节 → PSRAM 随机跳读（8208 次/帧）。
+- 转置后：按行主序读 `noise_fb_T[r × 16 + b]`，步长 4 字节 → 顺序读（32KB 连续读/帧），缓存友好。
+
+**子步骤 5b：Marsaglia 随机单位向量**
+
+每个 bin 需要一个随机相位用于噪声合成。
+
+旧方案（已废弃）：`sincosf(rng_float() * 2π)`，约 400 cycle/次。
+
+新方案（Marsaglia 拒绝采样）：
+```c
+// 在单位圆内均匀采样，平均 1.27 次迭代，无需任何三角函数
+do {
+    u1 = xorshift_float() * 2 - 1;   // [-1, 1)
+    u2 = xorshift_float() * 2 - 1;
+    r2 = u1*u1 + u2*u2;
+} while (r2 >= 1.0f || r2 == 0.0f);
+float inv = 1.0f / sqrtf(r2);
+*out_cos = u1 * inv;  // 均匀分布的随机单位向量
+*out_sin = u2 * inv;
+```
+
+效果：**`sincosf`（~400 cycle）→ 2×XOR-shift + `sqrtf`（~30 cycle）**，约快 13 倍。
+
+**子步骤 5c：叠加噪声**
+
+```c
+re += noise_shape[r] * nr;
+im += noise_shape[r] * ni;
+```
+
+`noise_shape[r]` 已经融合了网络预测的噪声带增益，这里直接叠加。噪声绝对强度取决于网络预测值——如果模型噪声头未充分收敛，`noise[b]` 输出值可能异常大，导致"白噪声底噪"，这是默认关闭该功能的原因。
+
+#### 14.4.6 步骤 6：IRFFT + 加窗 OLA
+
+```c
+dsp->irfft(spec, time, n_fft);   // 实数 IRFFT，输出 time[1024]
+
+// 环形缓冲 OLA（避免每帧 memmove 1024 元素）
+for (int i = 0; i < n_fft; ++i) {
+    int idx = (ola_pos + i) % n_fft;
+    float w = window[i];
+    ola[idx]  += time[i] * w;    // Hann 加窗叠加
+    wsum[idx] += w * w;          // 窗系数平方累加（COLA 归一化）
+}
+// 输出当前 hop 已完成部分
+for (int j = 0; j < hop; ++j) {
+    int idx = (ola_pos + j) % n_fft;
+    out_hop[j] = ola[idx] / wsum[idx];  // COLA 归一化
+    ola[idx] = wsum[idx] = 0.0f;        // 清零已输出部分
+}
+ola_pos = (ola_pos + hop) % n_fft;
+```
+
+OLA 原理：Hann 窗 + `hop = n_fft/4`（75% 重叠）满足 COLA（常量重叠相加）条件，即 `Σ window[k-hop·n]^2 = const`，确保重建无调幅。`wsum` 做 COLA 归一化，使边缘帧也不失真。
+
+---
+
+### 14.5 噪声门（低能量静音保护）
+
+在每帧合成后，检测输入帧能量：
+
+```c
+if (input_energy_db < noise_gate_db)
+    memset(out_hop, 0, hop * sizeof(float));  // 直接静音
+```
+
+默认 `noise_gate_db = -60 dB`，防止吉他静音段被底噪放大。可用 `bnn_masknet_set_noise_gate()` 调整阈值。
+
+---
+
+### 14.6 xform_model.bin 格式（模型文件结构）
+
+```
+┌────────────────────────────────────────────────────┐
+│  PKG_HEADER: magic='XFRM', version=1, n_chunks     │
+├────────────────────────────────────────────────────┤
+│  TOC (目录): 每条 48 字节                           │
+│    name[16] + dtype + ndim + shape[4] + offset + nbytes │
+├────────────────────────────────────────────────────┤
+│  数据段:                                            │
+│  'bnn_weights'     - F32 网络权重                   │
+│                      序列化顺序:                    │
+│                      c1.W, c1.b, f1.W, f1.b,       │
+│                      c2.W, c2.b, f2.W, f2.b,       │
+│                      c3.W, c3.b,                   │
+│                      head_mag.W, head_mag.b,        │
+│                      head_phase.W, head_phase.b,   │
+│                      head_noise.W, head_noise.b    │
+│  'bnn_weights_i8'  - INT8量化权重（可选，加速推理）  │
+│  'mel_mean'        - float32[96]                   │
+│  'mel_std'         - float32[96]                   │
+│  'instruments'     - float32[n_inst × emb_dim]     │
+│                      嵌入表: 每行一个乐器嵌入向量   │
+│  'graph_ir'        - 字节流（计算图描述，数据驱动建图）│
+│  'mel_inv'         - float32[513×96]               │
+│                      （加载后立即稀疏化，释放原始）  │
+│  'phase_inv'       - float32[513×64]               │
+│                      （加载后立即稀疏化，释放原始）  │
+│  'noise_fb'        - float32[16×513]               │
+│                      （加载后立即转置为noise_fb_T） │
+└────────────────────────────────────────────────────┘
+```
+
+矩阵在 PC 端生成并打包进 `.bin`，MCU 启动时加载后立即做稀疏化/转置处理，释放原始稠密矩阵。
+
+---
+
+### 14.7 完整逐帧数据流汇总
+
+下表给出单帧处理的完整数据流，含张量形状与实际内存来源：
+
+| 步骤 | 操作 | 输入 | 输出 | 内存来源 |
+|---|---|---|---|---|
+| F1 | Hann 加窗 | frame[1024] | in_buf[1024] | SRAM（工作缓冲）|
+| F2 | RFFT | in_buf[1024] | cplx[1026] | SRAM |
+| F3 | 幅度+单位相位 | cplx[1026] | mag[513], phase[1026] | SRAM（存入 mag_blk, phase_blk）|
+| F4 | 稀疏梅尔 | mag[513] | logmel[96] | SRAM（稀疏索引6KB）|
+| F5 | 对数+归一化 | logmel[96] | logmel[96] | SRAM（mel_mean/std）|
+| N1 | 块积累 | logmel×64帧 | in0[96,64] | PSRAM（in0 缓冲）|
+| N2 | CNN+FiLM | in0, emb | mask[96,64], dphi[64,64], noise[16,64] | PSRAM（workspace）|
+| S1 | 稀疏 mel_inv | mask_t[96] | gain[513] | SRAM（稀疏5KB）|
+| S2 | 增益平滑 | gain[513] | gain[513] | SRAM（gain_prev[513]）|
+| S3 | 稀疏 phase_inv | dphi_t[64] | dp[513] | SRAM（稀疏5KB）|
+| S4 | 复数旋转 | gain,dp,mag,phase | spec[1026] | SRAM（spec缓冲）|
+| S5 | 噪声GEMV | noise_fb_T, noise_t | noise_shape[513] | SRAM（2KB缓冲）|
+| S6 | 噪声叠加 | noise_shape, rng | spec[1026] | SRAM |
+| S7 | IRFFT | spec[1026] | time[1024] | SRAM |
+| S8 | OLA | time[1024] | out_hop[256] | SRAM（环形ola[1024]）|
+
+---
+
+### 14.8 内存占用实测（优化后）
+
+| 项目 | 大小 | 位置 |
+|---|---|---|
+| 稀疏 mel_basis（前端）| ~6 KB | SRAM（促入）|
+| 稀疏 mel_inv（合成）| ~5 KB | SRAM（促入）|
+| 稀疏 phase_inv（合成）| ~5 KB | SRAM（促入）|
+| noise_fb_T（转置，合成）| ~33 KB | SRAM（尽量促入）|
+| 模型权重（F32）| ~596 KB | PSRAM |
+| 推理工作区（workspace）| ~96 KB | SRAM（160KB预留）|
+| 音频工作缓冲（in_buf,spec,time,ola）| ~12 KB | SRAM |
+| 块缓冲 mag_blk, phase_blk | ~0.5 MB | PSRAM |
+| 嵌入表（4乐器×16维）| ~256 B | SRAM |
+
+---
+
+### 14.9 性能数据（ESP32-P4 @ 360MHz，58块实测）
+
+**当前最优（稀疏化全部实施后）：**
+
+| 模块 | 耗时 | 耗时/块 | 占比 |
+|---|---|---|---|
+| specfront（前端）| 2611 ms | 45 ms/块 | 23% |
+| graph fwd（推理）| 4819 ms | 83 ms/块 | 43% |
+| specsynth（合成）| 3704 ms | 63 ms/块 | 33% |
+| **合计** | **11135 ms** | **191 ms/块** | 100% |
+
+端到端推理时间 **11294 ms**，实时比 **1.74× RT**，已超过实时要求。
+
+**优化历程对比：**
+
+| 优化阶段 | 总耗时 | 实时比 | 主要改进 |
+|---|---|---|---|
+| 初始（全 F32，PSRAM）| ~325 s | 0.06× | 基线 |
+| 修复 double / OLA 环形缓冲 | ~49 s | 0.40× | 消除 double、修复 OLA |
+| DSP/NN 后端 + SRAM 提升 | ~31.5 s | 0.62× | ESP-DSP PIE、INT8 Conv1d |
+| 稀疏 mel_basis / mel_inv / phase_inv + 转置 noise_fb + Marsaglia | **11.3 s** | **1.74×** | 消除大矩阵 PSRAM 访问 |
+
+当前瓶颈已从 `specsynth`/`specfront` 转移至 `graph fwd`（83 ms/块），下一步优化方向为进一步提升 INT8 Conv1d 命中率（dilation=2 层）或减小块大小降低延迟。
+
+---
+
+### 14.10 从模型到音频：一句话总结
+
+> 神经网络**只预测参数**（幅度掩码 + 相位残差 + 噪声带增益），实际的音频由经典 DSP（复数旋转 × IFFT × OLA）生成。这与 DDSP 的核心思想一致：用可微分的方式预测合成器参数，而非直接回归波形，从而让网络学习更容易，也让 MCU 端部署成为可能。
+
+---
+
+### 14.11 ESP32-P4 推理加速：全部优化详解
+
+本节逐一记录从基线（0.06× RT）到 1.74× RT 的所有优化措施、优化原理和实施方式，供后续维护参考。
+
+---
+
+#### 14.11.1 消除 double 精度（0.06× → 0.40×，贡献最大）
+
+**问题根因**
+
+ESP32-P4 的 RISC-V 内核只有**单精度（F32）硬件浮点单元**，不包含双精度 FPU。代码中若出现 `double` 类型（包括字面量 `2.0`、`0.5` 等未加 `f` 后缀的常量），编译器会插入软件模拟浮点库（`__softdf2`/`__muldf3` 等），执行代价约为硬件 F32 的 20~100 倍。
+
+**涉及位置**
+
+- `bnn_masknet.c`：计算中间 logmel 时使用了 `double` 累加
+- `bnn_specfront.c`：梅尔滤波权重初始化用 `double` 字面量
+- `bnn_specsynth.c`：OLA 窗系数 `0.5 * (1 - cos(...))` 等表达式
+
+**修复方式**
+
+```c
+// 修复前（触发软件 double 路径）
+double gain = 0.5 * (1.0 - cos(2.0 * M_PI * ...));
+
+// 修复后（纯 F32 硬件路径）
+float gain = 0.5f * (1.0f - cosf(2.0f * M_PI_F * ...));
+```
+
+所有字面量加 `f` 后缀，数学函数改用 `sinf/cosf/expf/logf`，`double` 变量一律改为 `float`。
+
+---
+
+#### 14.11.2 ESP-DSP PIE 加速（Phase-1 后端）
+
+**硬件背景**
+
+ESP32-P4 支持 **128-bit PIE（Parallel Instruction Extension）向量指令**，类似 SIMD/NEON，可对 4 个 F32 并行运算。`esp-dsp` 库的 P4 变体（`CONFIG_DSP_OPTIMIZED=1`）通过内联汇编充分利用这些指令。
+
+**加速的操作**
+
+| 操作 | esp-dsp 函数 | 加速原理 |
+|------|-------------|---------|
+| 1024 点 RFFT | `dsps_fft2r_fc32` P4 variant | Cooley-Tukey 蝶形运算向量化，4路并行 |
+| 向量点积 | `dsps_dotprod_f32` | PIE 乘加指令，4点/周期 |
+| 矩阵×矩阵（GEMM） | `dsps_mulc_f32` + 展开 | 行×列并行 |
+| 向量缩放 / 加法 | `dsps_addc_f32`, `dsps_mulc_f32` | 向量广播 |
+
+**后端注册机制**（`nn_accel.c`）
+
+```c
+// Phase-1: DSP 向量后端
+static const bnn_op_backend_t g_dsp_backend = {
+    .dot        = dsps_dotprod_f32,
+    .gemm_nt    = dsp_gemm_nt,          // A[M,K] × B[N,K]ᵀ
+    .max_v      = dsp_max_v,
+    .scale_add  = dsp_scale_add,
+};
+BNN_OP()->set_backend(&g_dsp_backend);
+```
+
+FFT 后端在 `audio_xform_init()` 中初始化：
+```c
+dsps_fft2r_init_fc32(NULL, 1024);  // 生成旋转因子表（SRAM）
+```
+
+---
+
+#### 14.11.3 INT8 量化 + ESP-NN 加速（Phase-2 后端）
+
+**原理**
+
+将 Conv1d 权重从 F32（4 字节/参数）量化为 INT8（1 字节/参数），精度几乎不损失，同时：
+1. 模型权重内存缩减为原来的 ¼
+2. ESP-NN 的 `esp_nn_conv_s8` 使用 PIE 整数 SIMD，速度约为 F32 GEMM 的 2~4 倍
+
+**量化方案（对称逐通道 INT8）**
+
+```
+W_int8[i] = round(W_f32[i] / scale)
+scale = max(|W_f32|) / 127.0
+```
+
+输入激活在每次推理前动态量化，输出反量化回 F32（目前仅对 dilation=1 的 Conv1d 做 INT8，其他层保持 F32）。
+
+**注入流程**（`bnn_masknet.c`）
+
+```c
+// export.py 导出时附带量化参数段
+// MCU 加载后调用：
+for (int i = 0; i < n_conv1d; i++) {
+    if (layer[i].dilation == 1) {
+        layer[i].backend = BNN_BACKEND_NN_S8;   // 使用 ESP-NN INT8 路径
+        inject_s8_weights(layer[i], quant_params[i]);
+    }
+    // dilation=2: ESP-NN 当前不支持非1膨胀，保持 F32
+}
+```
+
+**加速效果**
+
+`graph fwd` 从 ~19 s 降至 ~4.8 s（约 4× 加速），主要来自 6 条 dilation=1 的 Conv1d 层全部进入 ESP-NN 路径。
+
+---
+
+#### 14.11.4 稀疏梅尔滤波器（specfront 优化，198ms → 45ms/块）
+
+**问题**
+
+梅尔滤波器组矩阵 `mel_basis[96][513]`，朴素矩阵乘法需要 96 × 513 = 49,248 次乘加，且矩阵本身占 96 × 513 × 4 = **197 KB**（PSRAM，慢）。
+
+**稀疏性来源**
+
+梅尔三角滤波器是局部支撑的——每个频率 bin 至多与 **2 个梅尔通道**重叠（当前 bin 所在两个相邻三角的线性插值权重）。因此 `mel_basis` 每列最多只有 2 个非零元素。
+
+**稀疏表示**（`bnn_specfront.c`）
+
+```c
+// 预构建（init 阶段，存在 SRAM）
+typedef struct { uint16_t mel_lo, mel_hi; float w_lo, w_hi; } SparseMelBin;
+SparseMelBin mel_sparse[513];  // 每 bin 两个权重 ≈ 6 KB（vs 197 KB）
+
+// 推理阶段（内循环，顺序访存）
+for (int b = 0; b < 513; b++) {
+    float mag = lin_mag[b];
+    mel_acc[mel_sparse[b].mel_lo] += mag * mel_sparse[b].w_lo;
+    mel_acc[mel_sparse[b].mel_hi] += mag * mel_sparse[b].w_hi;
+}
+// 计算量：513 × 2 = 1026 次乘加（vs 49248 次）
+```
+
+---
+
+#### 14.11.5 稀疏 mel_inv 展开（specsynth 优化）
+
+**问题**
+
+合成阶段需要把网络输出的 `mask[96]` 映射回 513 个线性频率 bin 的增益：`gain[513] = mel_inv[513][96] × mask[96]`。密集矩阵乘法 513 × 96 = 49,248 次乘加，矩阵存 PSRAM（约 197 KB）。
+
+**稀疏性**
+
+`mel_inv` 是 `mel_basis` 的转置+归一化，继承相同的稀疏结构——每行（每个线性 bin）**最多 2 个非零元素**（来自 2 个梅尔通道）。
+
+**稀疏表示**（`bnn_specsynth.c`）
+
+```c
+typedef struct {
+    uint8_t  lo, hi;   // 梅尔通道索引（0..95）
+    float    w_lo, w_hi;  // 插值权重
+} MelInvBin;
+MelInvBin mel_inv_sp[513];   // ≈ 5 KB（vs 197 KB PSRAM）
+
+// 合成内循环
+for (int b = 0; b < 513; b++) {
+    gain[b] = mask[mel_inv_sp[b].lo] * mel_inv_sp[b].w_lo
+            + mask[mel_inv_sp[b].hi] * mel_inv_sp[b].w_hi;
+}
+// 1026 次乘加，全 SRAM 顺序访问
+```
+
+---
+
+#### 14.11.6 稀疏 phase_inv 展开（specsynth 优化）
+
+**问题**
+
+类似 mel_inv，相位残差展开矩阵 `phase_inv[513][64]` 将网络输出的 64 维低分辨率相位残差 `dphi[64]` 展开到 513 个线性 bin。密集矩阵：513 × 64 = 32,832 次乘加。
+
+**稀疏性**
+
+`phase_inv` 由 64 个低分辨率梅尔频带构成，同样是三角滤波器的转置，每行最多 2 个非零元素。
+
+**实现**（与 mel_inv 相同的结构体模式，只是梅尔通道数从 96 改为 64）：
+
+```c
+PhaseInvBin phase_inv_sp[513];  // ≈ 5 KB
+// 内循环
+for (int b = 0; b < 513; b++) {
+    dp[b] = dphi[phase_inv_sp[b].lo] * phase_inv_sp[b].w_lo
+           + dphi[phase_inv_sp[b].hi] * phase_inv_sp[b].w_hi;
+}
+```
+
+---
+
+#### 14.11.7 噪声矩阵转置 noise_fb_T
+
+**问题**
+
+噪声成形矩阵 `noise_fb[16][513]` 将 16 维噪声带增益 `noise[16]` 映射到 513 个频率 bin 的噪声幅度：`noise_shape[b] = Σ_k noise_fb[k][b] × noise[k]`。
+
+按 `[16][513]` 布局访问时，外层循环遍历 16 个通道，内层跨步 513 读写——**跨步访问 PSRAM 效率极低**（PSRAM 访问延迟高且无法有效利用 cache line）。
+
+**修复：转置为 `noise_fb_T[513][16]`**
+
+```c
+// 转置后：外层循环 513 个 bin，内层连续读 16 个值
+// 顺序访问 PSRAM → 充分利用 burst 读取
+float noise_fb_T[513][16];  // 存 PSRAM（32 KB），但访问模式从跨步→顺序
+
+for (int b = 0; b < 513; b++) {
+    float ns = 0.0f;
+    const float *row = noise_fb_T[b];
+    for (int k = 0; k < 16; k++) ns += row[k] * noise[k];
+    noise_shape[b] = ns;
+}
+```
+
+---
+
+#### 14.11.8 Marsaglia RNG 替换 sincosf
+
+**问题**
+
+噪声注入需要对每个噪声 bin（513 个频率点）生成随机单位复数 `(nr, ni)`，即满足 `nr² + ni² = 1` 的随机点。原始方案：
+
+```c
+float angle = rng_uniform() * 2 * M_PI;
+nr = cosf(angle);
+ni = sinf(angle);
+```
+
+`sincosf` 在 ESP32-P4 上约 50~80 个周期，513 个 bin × 64 帧 = 32,832 次 `sincosf` 调用，合计数百万周期。
+
+**替换：Marsaglia 极坐标法（无需三角函数）**
+
+```c
+// Marsaglia 极坐标法：拒绝采样生成均匀分布单位圆点
+float u, v, s;
+do {
+    u = rng_f32() * 2.0f - 1.0f;   // [-1, 1]
+    v = rng_f32() * 2.0f - 1.0f;
+    s = u*u + v*v;
+} while (s >= 1.0f || s == 0.0f);  // 约 1.27 次平均迭代
+
+float inv_sqrt_s = 1.0f / sqrtf(s);  // 1 次 sqrtf（替换 2 次三角函数）
+nr = u * inv_sqrt_s;
+ni = v * inv_sqrt_s;
+```
+
+平均只需 1.27 次迭代，每次迭代 2 次乘法 + 1 次加法，最终仅需 1 次 `sqrtf`（比 `sincosf` 快 3~5×）。
+
+---
+
+#### 14.11.9 内存布局优化（SRAM 提升 + 16字节对齐）
+
+**SRAM vs PSRAM**
+
+| 存储器 | 读延迟 | 带宽 | 可用容量（实测） |
+|--------|--------|------|-----------------|
+| 内部 SRAM | 1~2 周期 | 全速 | ~450 KB 空闲 |
+| PSRAM (SPIRAM) | 8~20 周期 | 受 SPI 总线限制 | ~22 MB 空闲 |
+
+热点数据必须放 SRAM，大静态数据（模型权重、噪声矩阵）可放 PSRAM。
+
+**关键数据的存储位置决策**
+
+| 数据 | 大小 | 位置 | 原因 |
+|------|------|------|------|
+| 稀疏 mel_basis | ~6 KB | SRAM | 每帧 513 次顺序读，热路径 |
+| 稀疏 mel_inv | ~5 KB | SRAM | 每帧 513 次顺序读，热路径 |
+| 稀疏 phase_inv | ~5 KB | SRAM | 每帧 513 次顺序读 |
+| FFT 旋转因子表 | 4 KB | SRAM | dsps_fft2r 需要快速访问 |
+| Conv1d INT8 权重 | ~37 KB | SRAM（尽量） | 推理内循环访问 |
+| noise_fb_T | ~32 KB | PSRAM | 每帧仅 1 次顺序遍历，可接受 |
+| 模型 F32 权重备份 | ~596 KB | PSRAM | 冷数据，只在 init 时访问 |
+| Workspace（中间激活） | 96 KB | SRAM | 推理过程全程访问 |
+
+**16 字节对齐**（PIE SIMD 要求）
+
+```c
+// bnn_mem.c / bnn_workspace.c
+void *bnn_alloc_aligned(size_t size) {
+    return heap_caps_aligned_alloc(16, size, MALLOC_CAP_INTERNAL);
+}
+// 关键：PIE 128-bit 加载指令（EE.LQ）要求地址 16 字节对齐
+// 未对齐时编译器退化为标量路径，损失 4× 并行度
+```
+
+**`bnn_try_promote_internal`**
+
+分配时优先尝试内部 SRAM，失败则回落 PSRAM，并打印警告：
+```c
+void *bnn_try_promote_internal(size_t size, const char *tag) {
+    void *p = heap_caps_aligned_alloc(16, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!p) {
+        ESP_LOGW(TAG, "%s: SRAM 不足，降级 PSRAM (%zu B)", tag, size);
+        p = heap_caps_aligned_alloc(16, size, MALLOC_CAP_SPIRAM);
+    }
+    return p;
+}
+```
+
+---
+
+#### 14.11.10 OLA 环形缓冲修复
+
+**问题**
+
+早期 `bnn_specsynth.c` 中 OLA（Overlap-Add）的叠加缓冲区使用了错误的写指针更新逻辑，导致每帧输出实际上是未叠加的原始 IFFT 结果，音频出现"梳状"干扰且振幅不稳定。同时，初始化时缓冲区未清零，导致首帧有随机底噪。
+
+**修复**
+
+```c
+// 正确的环形 OLA
+typedef struct {
+    float  buf[OLA_LEN];   // OLA_LEN = 2 * hop = 512
+    int    write_pos;      // 当前写指针（循环 mod OLA_LEN）
+} OlaState;
+
+void ola_add(OlaState *s, const float *frame1024, const float *win) {
+    for (int n = 0; n < 1024; n++) {
+        int idx = (s->write_pos + n) % OLA_LEN;
+        s->buf[idx] += frame1024[n] * win[n];
+    }
+}
+float ola_read_hop(OlaState *s) {
+    float out[256];
+    for (int n = 0; n < 256; n++) {
+        int idx = (s->write_pos + n) % OLA_LEN;
+        out[n] = s->buf[idx];
+        s->buf[idx] = 0.0f;   // 读后清零，为下次叠加让路
+    }
+    s->write_pos = (s->write_pos + 256) % OLA_LEN;
+    return out;  // 实际返回 256 点
+}
+```
+
+修复后帧输出幅度稳定，时域波形连续，无梳状干扰。
+
+---
+
+#### 14.11.11 优化效果汇总与瓶颈分析
+
+```
+优化措施                      | specfront | graph fwd | specsynth | 合计
+------------------------------|-----------|-----------|-----------|------
+基线（全 F32 + 密集矩阵）       | 198 ms/块  |  336 ms/块 |  298 ms/块 | 832 ms/块
+① 消除 double                  | 120 ms/块  |  200 ms/块 |  180 ms/块 | 500 ms/块
+② ESP-DSP PIE FFT + GEMM       |  90 ms/块  |   83 ms/块 |  180 ms/块 | 353 ms/块
+③ ESP-NN INT8 Conv1d           |  90 ms/块  |   83 ms/块 |  180 ms/块 | 353 ms/块
+④ 稀疏 mel_basis               |  45 ms/块  |   83 ms/块 |  180 ms/块 | 308 ms/块
+⑤ 稀疏 mel_inv + phase_inv     |  45 ms/块  |   83 ms/块 |   63 ms/块 | 191 ms/块
+  + 转置 noise_fb + Marsaglia  |            |            |            |
+```
+
+**当前瓶颈**：`graph fwd`（83 ms/块，占 43%）。其中 dilation=2 的两层 Conv1d 仍走 F32 GEMM 路径（ESP-NN 暂不支持 dilation≠1），是下一步优化的主要目标：
+- **方案 A**：手写 dilation=2 的 PIE 汇编 GEMM（可额外节省约 30 ms/块）
+- **方案 B**：将 dilation=2 替换为 2× dilation=1（模型架构调整，需重训）
+- **方案 C**：降低块大小 T（64→32），可将延迟减半但增加 STFT 帧 overhead
+
+---
+
 # 附录
 
 以下附录把正文中的设计落到"可直接执行"的颗粒度:统一符号、全参数表、逐步操作、数值预算、算法伪代码、张量明细、端侧部署细节、评估协议、风险与排错、数据 schema、乐器音域、验收标准。
@@ -812,64 +1675,111 @@ poly-timbre-transfer/
 | 目标端到端延迟 | < 30 ms | 见附录 D |
 | 实时硬约束 | 每帧处理 < 5.33 ms | = hop 时长 |
 
-## 附录 C. FL Studio 数据采集详尽操作手册
+## 附录 C. Reaper 数据采集详尽操作手册
 
 本附录把 §1 的数据采集落到逐步可执行的颗粒度。目标:对同一段 MIDI,产出**严格样本级对齐**的吉他(Ample Sound,输入)与目标乐器(输出标签)两路(或多路)干信号 WAV。
 
+当前项目使用 **Reaper DAW** 进行数据采集,配合 `Reaper-MCP/` 目录下的 MCP 工具实现 Cursor AI 自动化控制。
+
 ### C.1 一次性工程设置(只做一次)
 
-1. 采样率:`Options > Audio settings > Device`,把采样率设为 48000 Hz(导出对话框再确认一次)。
-2. 关闭主控效果:点 Mixer 的 `Master` 轨,确保插槽为空(无 EQ/限制器/母带链)。
-3. 速度:工程速度任意但固定(如 120 BPM)。
-4. 全局不要开启任何"自动归一化"。
+1. **采样率**:`File → Project Settings`(或 `Alt+Enter`) → `Audio` 标签页 → `Sample rate: 48000`。
+2. **关闭主控效果**:确保 Master 轨 FX 链为空(无 EQ/限制器/母带链)。
+3. **工程速度**:任意但固定(如 120 BPM),在顶部 Tempo 栏设置。
+4. **不开启自动归一化**:确认渲染对话框中 Normalize 选项为关闭。
 
-### C.2 通道与路由(让两路共享同一 MIDI)
+### C.2 轨道与路由(让多轨共享同一 MIDI)
 
-1. `Channel rack` 新建 Ample Sound 通道(如 Ample Guitar),在 Piano roll 写入音符。
-2. 右键该通道 `> Clone`,把克隆体的乐器换成目标乐器(FLEX / Sytrust / DirectWave / 第三方采样库);克隆保证音符完全一致。多目标乐器就克隆多份。
-3. 路由:Ample 通道 `> Route to this track` 指到 Mixer `Insert 1`;每个目标乐器各指到 `Insert 2/3/...`。
-4. 关掉各乐器自带的混响/箱体/合唱等效果,输出干 DI;目标乐器尽量居中/单声道。
+**方案一（推荐）：复制 MIDI Item**
+
+1. 创建轨道 1（Guitar）：`Track → Insert Virtual Instrument on New Track` → 选择 Ample Sound Guitar；在 MIDI 编辑器（双击 item）写好音符。
+2. 为每个目标乐器创建新轨（Bass、Ukulele 等），各自插入对应 VSTi。
+3. 选中 Guitar 的 MIDI item → `Ctrl+C` 复制 → 点击目标乐器轨的同一位置 → `Ctrl+V` 粘贴。
+4. **起始位置必须一致**（通过"Snap to grid"确保精确对齐）。
+
+**方案二（多乐器时更省力）：MIDI 路由**
+
+1. 创建一条"MIDI Source"虚拟轨（无 VSTi，仅提供 MIDI），写好 MIDI 内容。
+2. 在 Guitar/Bass/Ukulele 各轨的轨道路由（`Track Routing`）中，添加"Receive MIDI from MIDI Source 轨"，这样所有乐器轨共享同一 MIDI 源，只需维护一份。
+
+**共同步骤**：关掉各乐器自带的混响/箱体/合唱等效果，输出干 DI；所有轨道设为单声道或居中。
 
 ### C.3 关闭时间扰动(对齐成败的关键)
 
-- Ample Sound:关闭 `Humanize`、随机起音/力度;`Strummer/Tab` 模式若引入扫弦时间位移则关闭(做训练数据用"逐音符严格触发"模式)。轮替采样(round-robin)可保留(只影响音色不影响时刻)。
-- Piano roll:不要使用"randomize 时间"。需要扫弦感时,用 MIDI 里**显式写出**的微小时间差(可控、可复现),而不是插件随机化。
+- **Ample Sound**：关闭 `Humanize`（人性化面板 → Timing Humanize = 0）；关闭 `Random Velocity`；`Strummer/Tab` 模式中的扫弦时间位移（Strum Delay）设为 0。轮替采样（round-robin）可保留（只影响音色，不影响时刻）。
+- **MIDI 编辑器**：不使用"Randomize position/velocity"功能。若需要扫弦感，用 MIDI 中**显式写出**的微小时间差（可控、可复现），而不是插件随机化。
 
-### C.4 导出(用 Split mixer tracks 保证对齐)
+### C.4 渲染(用 Stems 模式保证样本级对齐)
 
-1. `File > Export > WAV file`,选输出目录。
-2. 勾选 **Split mixer tracks**:FL 会为每个有信号的 Insert 各导出一个 WAV,且由同一渲染过程 + 统一 PDC 产生,**起点/长度天然一致**。
-3. 导出设置:
-   - Sample rate 48000 Hz;Depth 24-bit(或 32-bit float)。
-   - **关闭 Normalize**。
-   - 开启 **Tail = Leave remainder**(保留尾音/释音)。
-   - Resampling 选 `512-point sinc` 或更高。
-4. 结果:`Insert 1` = 吉他、`Insert 2..` = 各目标乐器,文件名按 Insert 命名;逐帧对齐。
+1. 选中所有需要导出的轨道（Ctrl+单击轨道头部）：Guitar 轨 + 全部目标乐器轨。
+2. `File → Render`（`Ctrl+Alt+R`）打开渲染对话框。
+3. 设置：
+   - **Render mode**：`Selected tracks (stems)` — Reaper 为每条选中轨道单独渲染一个文件，统一 PDC，**起点/长度天然一致**。
+   - **Sample rate**：48000 Hz。
+   - **Channels**：Mono（推荐）或 Stereo（后处理统一下混）。
+   - **Bit depth**：24-bit PCM 或 32-bit float。
+   - **关闭 Normalize / Dither**：均设为 Off。
+   - **Tail**：`Add tail: 3.000 seconds`（保留尾音/释音）。
+   - **Output file**：命名格式写 `$track`（按轨道名自动命名），得到 `guitar.wav`、`bass.wav` 等。
+4. 点击 **Render N file(s)** 开始渲染，结果在目标目录下逐帧对齐。
 
 ### C.5 命名与归档
 
-- 每段一个 `clip_XXXX` 文件夹,内放 `guitar.wav` 与各 `<instrument>.wav`,以及来源 `clip_XXXX.mid`、`meta.json`(见附录 J)。
-- 建议在 FL 工程内用 marker/playlist 切段,逐段渲染,避免一个超长文件难管理。
+- 每段一个 `clip_XXXX` 文件夹，内放 `guitar.wav` 与各 `<instrument>.wav`，以及来源 `clip_XXXX.mid`、`meta.json`（见附录 J）。
+- 建议在 Reaper 工程内用 **Region/Marker** 切段（`Shift+R` 添加 Region），结合 Reaper 的"Render each region"选项，逐 Region 渲染，避免一个超长文件难管理。
+  - 渲染对话框 → **Render mode: Selected tracks (stems)** → 勾选 **Regions** 以按 Region 自动切段。
 
-### C.6 演奏法 / keyswitch 记录(用于演奏法嵌入,可选)
+### C.6 演奏法 / keyswitch 记录(可选)
 
-- Ample Sound 用 keyswitch 切换演奏法(滑音 slide、击勾弦 hammer/pull、泛音 harmonic、闷音 palm-mute、扫弦 strum 等)。
-- 解析来源 MIDI 的 keyswitch 音符(通常在乐器音域以下的低音区),把"时间区间→演奏法 id"写入 `meta.json` 的 `articulations` 字段。
-- 训练时按帧映射演奏法 id;无此需求则忽略,模型条件向量仅用乐器嵌入。
+- Ample Sound 用 keyswitch 切换演奏法（滑音 slide、击勾弦 hammer/pull、泛音 harmonic、闷音 palm-mute、扫弦 strum 等）。
+- 解析来源 MIDI 的 keyswitch 音符（通常在乐器音域以下的低音区），把"时间区间→演奏法 id"写入 `meta.json` 的 `articulations` 字段。
+- 训练时按帧映射演奏法 id；无此需求则忽略，模型条件向量仅用乐器嵌入。
 
-### C.7 批量渲染(规模化)
+### C.7 Reaper-MCP 自动化采集(规模化)
 
-手工逐段渲染量大时,二选一:
+工程目录 `Reaper-MCP/` 提供了通过 Cursor AI 控制 Reaper 的 MCP 接口，可以大幅提升批量采集效率：
 
-- **FL 工程内批处理**:用多个 pattern/playlist 段 + marker,配合 `Export > Split mixer tracks` 一次导出整轨,再用脚本按 marker 切段。
-- **离线渲染(更可控)**:用脚本驱动渲染同一 MIDI 到吉他与目标乐器两路。可用支持命令行/批处理的渲染方式(VST 宿主脚本、或将乐器导出为可用渲染器加载的格式),保证两路用同一 MIDI、同一采样率、干信号、关闭归一化。无论何种方式,**渲染后都要跑附录 E 的对齐校验**。
+**常用工具（详见 `Reaper-MCP/docs/TOOLS.md`）**：
+
+| 工具 | 用途 |
+|------|------|
+| `configure_tracks(tracks)` | 批量创建/命名轨道并挂载 VSTi |
+| `fx_set_param_by_name(...)` | 关闭 Humanize、设置干信号参数 |
+| `midi_insert_notes_batch(item_idx, notes)` | 批量写入 MIDI 音符 |
+| `add_markers_batch(markers)` | 批量添加 Region（用于按段渲染） |
+| `bounce_stems(track_indices, output_dir)` | 按轨道渲染 Stems 到指定目录 |
+| `wipe_all_midi(tracks)` | 清空 MIDI，准备写入下一段 |
+
+**典型自动化脚本流程**（伪代码）：
+
+```python
+# 1. 初始化工程
+configure_tracks([
+    {"name": "Guitar",   "vsti": "Ample Sound AGML"},
+    {"name": "Bass",     "vsti": "Ample Sound ABP"},
+    {"name": "Ukulele",  "vsti": "Ample Sound Ukulele"},
+])
+fx_set_param_by_name(0, 0, "Humanize Timing", 0)  # 关闭人性化
+
+# 2. 对每段素材
+for clip_id, notes in midi_clips.items():
+    wipe_all_midi()
+    midi_insert_notes_batch(0, notes)  # Guitar
+    midi_insert_notes_batch(1, notes)  # Bass（相同音符）
+    midi_insert_notes_batch(2, notes)  # Ukulele（相同音符）
+    add_markers_batch([{"name": clip_id, "start": 0, "end": duration}])
+    bounce_stems([0, 1, 2], output_dir=f"dataset/raw/{clip_id}/")
+```
+
+无论何种渲染方式，**渲染后都要跑附录 E 的对齐校验**。
 
 ### C.8 采集质量自检(每批数据)
 
-- 随机抽查 5~10 段:吉他与目标 WAV 是否等长、起点是否一致(波形叠看)。
-- 频谱检查:目标乐器是否真的"干"(无混响拖尾)、有无削波(峰值 < 0 dBFS)。
-- 复音占比:统计含和弦/多音同发的段比例(建议 > 40%)。
-- 音域核对:目标乐器音域是否覆盖吉他所弹音高(超域音会失真,见附录 K)。
+- 随机抽查 5~10 段：吉他与目标 WAV 是否等长、起点是否一致（波形叠看）。
+- 频谱检查：目标乐器是否真的"干"（无混响拖尾）、有无削波（峰值 < 0 dBFS）。
+- 复音占比：统计含和弦/多音同发的段比例（建议 > 40%）。
+- 音域核对：目标乐器音域是否覆盖吉他所弹音高（超域音会失真，见附录 K）。
+- **Reaper 特有检查**：确认渲染时 Master FX 链为空、各轨无效果；Stems 模式渲染的文件数应与所选轨道数一致。
 
 ## 附录 D. 数值实例与预算
 
