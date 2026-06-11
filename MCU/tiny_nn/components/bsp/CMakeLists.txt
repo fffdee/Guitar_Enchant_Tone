@@ -6,6 +6,7 @@
 idf_component_register(
     SRCS
         "02_device/sd_card.c"
+        "02_device/usb_msc.c"
         "03_framework/drv_device.c"
         "03_framework/drv_init.c"
         "05_component/fs_mount.c"
@@ -26,6 +27,7 @@ idf_component_register(
     REQUIRES
         tinynn fatfs sdmmc esp_driver_sdmmc vfs driver esp_psram esp_timer
         espressif__esp-dsp espressif__esp-nn console
+        espressif__esp_tinyusb
 )
 
 # 把 -Werror=format 降为警告 (uint32_t=long unsigned int 在 xtensa/riscv 工具链差异)

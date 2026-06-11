@@ -10,6 +10,7 @@
 #include "bsp.h"
 #include "audio_xform.h"
 #include "infer_worker.h"
+#include "usb_msc.h"
 
 static const char *TAG = "cli";
 
@@ -81,6 +82,62 @@ static int cmd_sdinfo(int argc, char **argv)
     return 0;
 }
 
+/* ---------- usb app|host|status ---------- */
+static int cmd_usb(int argc, char **argv)
+{
+    if (argc < 2 || !strcmp(argv[1], "status")) {
+        printf("USB: ready=%d attached=%d cdc=%d busy=%d port=%d mount=%s\n",
+               usb_msc_is_ready() ? 1 : 0,
+               usb_msc_is_attached() ? 1 : 0,
+               usb_msc_console_ready() ? 1 : 0,
+               usb_msc_is_busy() ? 1 : 0,
+               usb_msc_port(),
+               usb_msc_mount_name());
+        printf("用法: usb app | usb host | usb status\n");
+        return 0;
+    }
+
+    esp_err_t err;
+    if (!strcmp(argv[1], "app")) {
+        if (!usb_msc_is_ready()) {
+            printf("TinyUSB 未初始化, 当前只能尝试普通 APP /sdcard 模式\n");
+            return 0;
+        }
+        err = usb_msc_mount_app();
+        if (err == ESP_OK) {
+            printf("SD 已切换到 APP 模式: MCU 可访问 %s\n", BSP_SD_MOUNT);
+            return 0;
+        }
+        printf("切换到 APP 失败: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    if (!strcmp(argv[1], "host")) {
+        if (infer_worker_busy()) {
+            printf("正在推理, 不能切换到 USB Host\n");
+            return 1;
+        }
+        if (!usb_msc_is_ready()) {
+            printf("TinyUSB 未初始化, 不能切换到 USB Host\n");
+            return 1;
+        }
+        err = usb_msc_mount_usb();
+        if (err == ESP_OK) {
+            if (usb_msc_is_attached()) {
+                printf("SD 已切换到 USB Host 模式: PC 可访问 U 盘; 完成后请安全弹出并执行 usb app\n");
+            } else {
+                printf("SD 已切换到 USB Host 模式, 但 TinyUSB 设备尚未被 PC 枚举(attached=0); 请确认连接的是 USB-OTG/HS 口而不是下载/JTAG 口\n");
+            }
+            return 0;
+        }
+        printf("切换到 USB Host 失败: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("未知 usb 子命令: %s (用法: usb app | usb host | usb status)\n", argv[1]);
+    return 1;
+}
+
 static audio_clip_mode_t parse_clip(const char *s)
 {
     if (!s) return AUDIO_CLIP_LIMIT;
@@ -140,6 +197,7 @@ static void register_cmds(void)
         { .command = "stats",  .help = "推理时间统计 (次数/avg/min/max/RT); stats reset 清零", .func = &cmd_stats },
         { .command = "ls",     .help = "列目录: ls [路径] (默认 /sdcard)", .func = &cmd_ls },
         { .command = "sdinfo", .help = "SD 卡挂载状态", .func = &cmd_sdinfo },
+        { .command = "usb",    .help = "USB 复合设备控制: usb app|host|status", .func = &cmd_usb },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i)
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
@@ -149,18 +207,25 @@ esp_err_t cli_start(void)
 {
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_cfg = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
-    repl_cfg.prompt = "xform>";
+    repl_cfg.prompt = "xform> ";
     repl_cfg.max_cmdline_length = 128;
+    repl_cfg.max_history_len = 16;
 
     esp_console_dev_uart_config_t uart_cfg = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
     esp_err_t err = esp_console_new_repl_uart(&uart_cfg, &repl_cfg, &repl);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "REPL 创建失败: %s", esp_err_to_name(err)); return err; }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "REPL 创建失败: %s", esp_err_to_name(err));
+        return err;
+    }
 
     esp_console_register_help_command();
     register_cmds();
 
     err = esp_console_start_repl(repl);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "REPL 启动失败: %s", esp_err_to_name(err)); return err; }
-    ESP_LOGI(TAG, "命令行就绪 (输入 help 查看命令)");
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "REPL 启动失败: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "主控制台命令行就绪 (输入 help 查看命令)");
     return ESP_OK;
 }

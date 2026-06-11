@@ -1,5 +1,6 @@
 #include "infer_worker.h"
 #include "audio_xform.h"
+#include "usb_msc.h"
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
@@ -79,10 +80,21 @@ static void worker_task(void *arg)
                  job.instrument, job.in_path, job.out_path,
                  job.opt.pitch_semitones, job.opt.gain_db, (int)job.opt.clip_mode);
         st_set_busy(job.instrument);
-        ensure_parent_dir(job.out_path);
 
         int64_t t0 = esp_timer_get_time();
-        esp_err_t rc = audio_xform_file(job.in_path, job.out_path, job.instrument, &job.opt);
+        usb_msc_set_busy(true);   /* 推理占用 SD，阻止切到 USB Host */
+        esp_err_t rc = ESP_OK;
+        if (usb_msc_is_ready()) {
+            rc = usb_msc_mount_app();
+            if (rc != ESP_OK) {
+                ESP_LOGE(TAG, "SD 切回 APP 模式失败: %s", esp_err_to_name(rc));
+            }
+        }
+        if (rc == ESP_OK) {
+            ensure_parent_dir(job.out_path);
+            rc = audio_xform_file(job.in_path, job.out_path, job.instrument, &job.opt);
+        }
+        usb_msc_set_busy(false);
         int ms = (int)((esp_timer_get_time() - t0) / 1000);
 
         st_set_done(job.instrument, (int)rc, ms);
