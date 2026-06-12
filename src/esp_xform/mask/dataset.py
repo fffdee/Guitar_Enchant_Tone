@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from ..audio.io import load_wav
-from .audio import build_all_matrices, stft
+from .audio import build_all_matrices, hann_window, stft
 
 try:
     import torch
@@ -219,6 +219,66 @@ class MaskWindowDataset(Dataset):
             "Ymag": tt(Ylin),           # [n_bins,T]
             "Yphase": tt(Yphase),       # [n_bins,T]
             "target_wav": torch.tensor(tw, dtype=torch.float32),  # [win_samples]
+            "inst_id": torch.tensor(inst_id, dtype=torch.long),
+        }
+
+
+class MaskWaveDataset(Dataset):
+    """只返回原始波形的数据集（用于GPU加速STFT）。
+
+    返回：吉他波形、目标波形、乐器ID。STFT计算在训练循环中使用PyTorch GPU完成。
+    """
+
+    def __init__(self, cfg, proc_dir: Optional[str] = None, augment=None) -> None:
+        if not _HAS_TORCH:
+            raise RuntimeError("MaskWaveDataset 需要 torch")
+        self.cfg = cfg
+        self.s = cfg.stft
+        proc = Path(proc_dir or cfg.paths.proc_dir)
+        self.pairs_dir = proc / "pairs"
+        self.index = json.loads((proc / "windows.json").read_text(encoding="utf-8"))
+        st = np.load(proc / "stats.npz")
+        self.mel_mean = torch.tensor(st["mel_mean"], dtype=torch.float32)
+        self.mel_std = torch.tensor(st["mel_std"], dtype=torch.float32)
+        self.mel_basis = torch.tensor(np.load(proc / "mel_basis.npy"), dtype=torch.float32)
+        self.T = cfg.train.win_frames
+        self.hop = self.s.hop
+        self.win_samples = self.T * self.hop
+        self.augment = augment
+        self._rng = np.random.default_rng(cfg.train.seed)
+        self._cache_file = None
+        self._cache = None
+        self._window = torch.tensor(hann_window(self.s.n_fft), dtype=torch.float32)
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def _load_pair(self, fname: str):
+        if fname != self._cache_file:
+            self._cache = np.load(self.pairs_dir / fname)
+            self._cache_file = fname
+        return self._cache
+
+    def __getitem__(self, i: int):
+        rec = self.index[i]
+        d = self._load_pair(rec["file"])
+        start = rec["start"]
+        s0 = start * self.hop
+        gw = np.asarray(d["g"][s0: s0 + self.win_samples], dtype=np.float32)
+        tw = np.asarray(d["t"][s0: s0 + self.win_samples], dtype=np.float32)
+        if len(gw) < self.win_samples:
+            gw = np.pad(gw, (0, self.win_samples - len(gw)))
+        if len(tw) < self.win_samples:
+            tw = np.pad(tw, (0, self.win_samples - len(tw)))
+        inst_id = int(d["inst_id"])
+
+        if self.augment is not None:
+            from .augment import augment_input
+            gw = augment_input(gw, self.s.sample_rate, self.augment, self._rng).astype(np.float32)
+
+        return {
+            "g_wav": torch.tensor(gw, dtype=torch.float32),  # [win_samples]
+            "t_wav": torch.tensor(tw, dtype=torch.float32),  # [win_samples]
             "inst_id": torch.tensor(inst_id, dtype=torch.long),
         }
 

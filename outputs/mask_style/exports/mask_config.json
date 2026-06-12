@@ -26,9 +26,9 @@
   "train": {
     "win_frames": 128,
     "win_stride": 64,
-    "batch_size": 32,
-    "epochs": 120,
-    "lr": 0.0003,
+    "batch_size": 16,
+    "epochs": 5000,
+    "lr": 0.00035,
     "weight_decay": 1e-05,
     "grad_clip": 1.0,
     "seed": 42,

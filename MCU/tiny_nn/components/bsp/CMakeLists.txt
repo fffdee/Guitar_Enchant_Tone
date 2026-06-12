@@ -1,12 +1,13 @@
 # BSP: 仿 banux 分层的板级支持 (ESP-IDF 原生驱动)
-#   02_device   设备驱动 (SD 卡)
+#   02_device   设备驱动 (SD 卡 / I2S)
 #   03_framework 驱动框架 (设备注册 / 初始化序列)
 #   05_component 组件 (FATFS 挂载 / WAV 读写 / 模型产物加载)
-#   06_app      应用 (音色转换: 读wav→推理→写wav)
+#   06_app      应用 (音色转换: 读wav→推理→写wav / I2S实时推理)
 idf_component_register(
     SRCS
         "02_device/sd_card.c"
         "02_device/usb_msc.c"
+        "02_device/i2s_driver.c"
         "03_framework/drv_device.c"
         "03_framework/drv_init.c"
         "05_component/fs_mount.c"
@@ -17,6 +18,7 @@ idf_component_register(
         "05_component/audio_post.c"
         "06_app/audio_xform.c"
         "06_app/infer_worker.c"
+        "06_app/i2s_xform.c"
         "06_app/cli.c"
     INCLUDE_DIRS
         "include"

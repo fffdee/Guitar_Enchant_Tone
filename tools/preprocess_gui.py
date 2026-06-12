@@ -134,13 +134,17 @@ class MainWindow(QMainWindow):
     def _tab_train(self):
         w = QWidget(); f = QFormLayout(w)
         self.tr_cfg_w, self.tr_cfg = path_row("configs/mask.json", "open", "JSON/YAML (*.json *.yaml *.yml)")
+        self.tr_inst_w, self.tr_inst = path_row("configs/instruments.json", "open", "JSON/YAML (*.json *.yaml *.yml)")
         self.tr_proc_w, self.tr_proc = path_row("dataset/proc", "dir")
         self.tr_epochs = QSpinBox(); self.tr_epochs.setRange(1, 5000); self.tr_epochs.setValue(50)
         self.tr_device = QComboBox(); self.tr_device.addItems(["auto", "cuda", "cpu"])
+        self.tr_gpu_accel = QComboBox(); self.tr_gpu_accel.addItems(["off", "on"])
         f.addRow("配置", self.tr_cfg_w)
+        f.addRow("乐器配置", self.tr_inst_w)
         f.addRow("proc 目录", self.tr_proc_w)
         f.addRow("epochs", self.tr_epochs)
         f.addRow("device", self.tr_device)
+        f.addRow("GPU加速", self.tr_gpu_accel)
         btn = QPushButton("开始训练 (含导出)")
         btn.setProperty("run", True)
         btn.clicked.connect(self.run_train)
@@ -193,9 +197,12 @@ class MainWindow(QMainWindow):
 
     def run_train(self):
         args = [str(ROOT / "scripts/train_mask.py"), "--config", self.tr_cfg.text(),
+                "--instruments", self.tr_inst.text(),
                 "--proc", self.tr_proc.text(), "--epochs", str(self.tr_epochs.value())]
         if self.tr_device.currentText() != "auto":
             args += ["--device", self.tr_device.currentText()]
+        if self.tr_gpu_accel.currentText() == "on":
+            args += ["--gpu-accelerate"]
         self.run(args, "训练")
 
     def run_render(self):

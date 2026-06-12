@@ -10,6 +10,8 @@
 #include "bsp.h"
 #include "audio_xform.h"
 #include "infer_worker.h"
+#include "i2s_driver.h"
+#include "i2s_xform.h"
 #include "usb_msc.h"
 
 static const char *TAG = "cli";
@@ -33,6 +35,12 @@ static int cmd_status(int argc, char **argv)
     char st[160];
     infer_worker_status(st, sizeof(st));
     printf("%s\n", st);
+    /* I2S 实时推理状态 */
+    if (i2s_xform_running()) {
+        char ist[160];
+        i2s_xform_status(ist, sizeof(ist));
+        printf("%s\n", ist);
+    }
     printf("PSRAM free=%uKB  内部RAM free=%uKB\n",
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
@@ -188,11 +196,168 @@ static int cmd_infer(int argc, char **argv)
     return 0;
 }
 
+/* ---------- mode sd|i2s ---------- */
+static int cmd_mode(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: mode sd | mode i2s\n");
+        printf("  sd  - SD 卡文件模式 (读WAV -> 推理 -> 写WAV)\n");
+        printf("  i2s - I2S 实时模式 (I2S RX -> 推理 -> I2S TX)\n");
+        return 1;
+    }
+
+    if (!strcmp(argv[1], "sd")) {
+        /* 停止 I2S 实时推理 (如果正在运行) */
+        if (i2s_xform_running()) {
+            i2s_xform_stop();
+            printf("I2S 实时推理已停止\n");
+        }
+        /* 确保 SD 推理 worker 已启动 */
+        if (!infer_worker_busy()) {
+            infer_worker_start();
+        }
+        printf("已切换到 SD 卡文件模式\n");
+        return 0;
+    }
+
+    if (!strcmp(argv[1], "i2s")) {
+        if (!audio_xform_loaded()) { printf("模型未加载, 无法使用 I2S 模式\n"); return 1; }
+        /* 初始化 I2S 驱动 (如果尚未初始化) */
+        if (!i2s_driver_is_ready()) {
+            esp_err_t err = i2s_driver_init(0);
+            if (err != ESP_OK) {
+                printf("I2S 初始化失败: %s\n", esp_err_to_name(err));
+                return 1;
+            }
+        }
+        printf("已切换到 I2S 实时模式, 使用 'live <乐器>' 开始实时推理\n");
+        return 0;
+    }
+
+    printf("未知模式: %s (用法: mode sd | mode i2s)\n", argv[1]);
+    return 1;
+}
+
+/* ---------- live <instrument|stop> [-p pitch][-g gain][-c clip] ---------- */
+static int cmd_live(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: live <乐器> [-p 变调][-g 增益dB][-c limit|soft|hard][-N 开噪声]\n");
+        printf("      live stop                  停止实时推理\n");
+        printf("      live instrument <名称>     运行时切换乐器\n");
+        printf("例:   live bass -p -12 -g 9 -c soft\n");
+        return 1;
+    }
+
+    /* live stop: 停止实时推理 */
+    if (!strcmp(argv[1], "stop")) {
+        if (!i2s_xform_running()) { printf("实时推理未在运行\n"); return 0; }
+        i2s_xform_stop();
+        printf("实时推理已停止\n");
+        return 0;
+    }
+
+    /* live instrument <名称>: 运行时切换乐器 */
+    if (!strcmp(argv[1], "instrument") || !strcmp(argv[1], "inst")) {
+        if (argc < 3) { printf("用法: live instrument <乐器名>\n"); return 1; }
+        if (!i2s_xform_running()) { printf("实时推理未在运行, 请先 'live <乐器>' 启动\n"); return 1; }
+        esp_err_t err = i2s_xform_set_instrument(argv[2]);
+        if (err == ESP_ERR_NOT_FOUND) {
+            printf("乐器 '%s' 不在模型中\n", argv[2]);
+            return 1;
+        }
+        printf("已切换到: %s\n", argv[2]);
+        return 0;
+    }
+
+    /* live <乐器>: 启动实时推理 */
+    if (!audio_xform_loaded()) { printf("模型未加载\n"); return 1; }
+    if (i2s_xform_running()) {
+        /* 已在运行, 切换乐器 */
+        esp_err_t err = i2s_xform_set_instrument(argv[1]);
+        if (err == ESP_ERR_NOT_FOUND) {
+            printf("乐器 '%s' 不在模型中\n", argv[1]);
+            return 1;
+        }
+        printf("已切换到: %s\n", argv[1]);
+        return 0;
+    }
+
+    /* 确保 I2S 已初始化 */
+    if (!i2s_driver_is_ready()) {
+        esp_err_t err = i2s_driver_init(0);
+        if (err != ESP_OK) {
+            printf("I2S 初始化失败: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+    }
+
+    i2s_xform_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    strncpy(cfg.instrument, argv[1], sizeof(cfg.instrument) - 1);
+    cfg.clip_mode = AUDIO_CLIP_LIMIT;
+
+    for (int i = 2; i < argc; ) {
+        if (!strcmp(argv[i], "-N")) {
+            cfg.add_noise = 1;
+            i++; continue;
+        }
+        if (i + 1 >= argc) { printf("参数 %s 缺少值\n", argv[i]); return 1; }
+        if      (!strcmp(argv[i], "-p")) cfg.pitch_semitones = strtof(argv[i + 1], NULL);
+        else if (!strcmp(argv[i], "-g")) cfg.gain_db = strtof(argv[i + 1], NULL);
+        else if (!strcmp(argv[i], "-c")) cfg.clip_mode = parse_clip(argv[i + 1]);
+        else { printf("未知参数: %s\n", argv[i]); return 1; }
+        i += 2;
+    }
+
+    esp_err_t err = i2s_xform_start(&cfg);
+    if (err != ESP_OK) {
+        printf("启动失败: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    printf("实时推理已启动: %s (pitch %+.1f, gain %+.1fdB, clip %d)\n",
+           cfg.instrument, cfg.pitch_semitones, cfg.gain_db, (int)cfg.clip_mode);
+    printf("  'live stop' 停止, 'live instrument <名称>' 切换乐器, 'status' 查看状态\n");
+    return 0;
+}
+
+/* ---------- i2s init|deinit|info ---------- */
+static int cmd_i2s(int argc, char **argv)
+{
+    if (argc < 2 || !strcmp(argv[1], "info")) {
+        printf("I2S: ready=%d  running=%d\n",
+               i2s_driver_is_ready() ? 1 : 0,
+               i2s_xform_running() ? 1 : 0);
+        printf("引脚: MCLK=%d BCLK=%d WS=%d DOUT=%d DIN=%d\n",
+               I2S_MCLK, I2S_BCLK, I2S_WS, I2S_DOUT, I2S_DIN);
+        return 0;
+    }
+    if (!strcmp(argv[1], "init")) {
+        int sr = 0;
+        if (argc >= 3) sr = atoi(argv[2]);
+        esp_err_t err = i2s_driver_init(sr);
+        if (err == ESP_OK) printf("I2S 初始化成功 (sr=%d)\n", sr > 0 ? sr : 48000);
+        else printf("I2S 初始化失败: %s\n", esp_err_to_name(err));
+        return (err == ESP_OK) ? 0 : 1;
+    }
+    if (!strcmp(argv[1], "deinit")) {
+        if (i2s_xform_running()) i2s_xform_stop();
+        i2s_driver_deinit();
+        printf("I2S 已释放\n");
+        return 0;
+    }
+    printf("用法: i2s init [sr] | i2s deinit | i2s info\n");
+    return 1;
+}
+
 static void register_cmds(void)
 {
     const esp_console_cmd_t cmds[] = {
         { .command = "model",  .help = "打印已加载模型信息(采样率/参数量/乐器列表)", .func = &cmd_model },
-        { .command = "infer",  .help = "推理: infer <乐器> [-i in][-o out][-p 变调][-g 增益dB][-c clip][-N 开噪声]", .func = &cmd_infer },
+        { .command = "infer",  .help = "SD卡推理: infer <乐器> [-i in][-o out][-p 变调][-g 增益dB][-c clip][-N 开噪声]", .func = &cmd_infer },
+        { .command = "live",   .help = "I2S实时推理: live <乐器> [-p 变调][-g 增益dB][-c clip][-N] | live stop | live inst <名称>", .func = &cmd_live },
+        { .command = "mode",   .help = "切换运行模式: mode sd | mode i2s", .func = &cmd_mode },
+        { .command = "i2s",    .help = "I2S 驱动管理: i2s init [sr] | i2s deinit | i2s info", .func = &cmd_i2s },
         { .command = "status", .help = "查看推理 worker 状态与内存", .func = &cmd_status },
         { .command = "stats",  .help = "推理时间统计 (次数/avg/min/max/RT); stats reset 清零", .func = &cmd_stats },
         { .command = "ls",     .help = "列目录: ls [路径] (默认 /sdcard)", .func = &cmd_ls },

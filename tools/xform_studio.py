@@ -123,10 +123,11 @@ class TrainWorker(QtCore.QThread):
     done = QtCore.pyqtSignal(dict)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, cfg_path, inst_path, epochs, lr, batch, device):
+    def __init__(self, cfg_path, inst_path, epochs, lr, batch, device, gpu_accel=False):
         super().__init__()
         self.cfg_path, self.inst_path = cfg_path, inst_path
         self.epochs, self.lr, self.batch, self.device = epochs, lr, batch, device
+        self.gpu_accel = gpu_accel
         self._stop = False
 
     def request_stop(self):
@@ -135,7 +136,7 @@ class TrainWorker(QtCore.QThread):
     def run(self):
         try:
             import torch
-            from esp_xform.mask.train import train as train_mask
+            from esp_xform.mask.train import train as train_mask, train_gpu
             from esp_xform.mask.model import MaskNet
             from esp_xform.mask.export import export_masknet_artifacts
 
@@ -145,15 +146,17 @@ class TrainWorker(QtCore.QThread):
             cfg.train.batch_size = int(self.batch)
             inst = load_instruments(self.inst_path)["instruments"]
 
+            use_gpu = self.gpu_accel and self.device == "cuda" and torch.cuda.is_available()
             self.log.emit(f"开始训练: device={self.device} epochs={self.epochs} "
-                          f"lr={self.lr} batch={self.batch} 乐器={inst}")
+                          f"lr={self.lr} batch={self.batch} 乐器={inst} GPU加速={'开启' if use_gpu else '关闭'}")
 
             def on_epoch(ep, tr, val, best):
                 self.epoch.emit(int(ep), float(tr),
                                 float(val) if val is not None else -1.0, float(best))
 
-            info = train_mask(cfg, inst, device=self.device,
-                              on_epoch=on_epoch, should_stop=lambda: self._stop)
+            train_fn = train_gpu if use_gpu else train_mask
+            info = train_fn(cfg, inst, device=self.device,
+                           on_epoch=on_epoch, should_stop=lambda: self._stop)
             self.log.emit(f"训练结束: {info}")
 
             # 自动导出产物(权重/矩阵/嵌入/统计)
@@ -397,8 +400,11 @@ class Studio(QtWidgets.QMainWindow):
         self.sp_batch = QtWidgets.QSpinBox(); self.sp_batch.setRange(1, 512); self.sp_batch.setValue(32)
         self.cb_device = QtWidgets.QComboBox()
         self.cb_device.addItems((["cuda"] if self._has_cuda else []) + ["cpu"])
+        self.cb_gpu_accel = QtWidgets.QComboBox()
+        self.cb_gpu_accel.addItems(["off", "on"])
         for lbl, wid in [("epochs", self.sp_epochs), ("lr", self.sp_lr),
-                         ("batch", self.sp_batch), ("device", self.cb_device)]:
+                         ("batch", self.sp_batch), ("device", self.cb_device),
+                         ("GPU加速", self.cb_gpu_accel)]:
             cfg.addWidget(QtWidgets.QLabel(lbl)); cfg.addWidget(wid)
         cfg.addStretch(1)
         self.btn_train = QtWidgets.QPushButton("开始训练")
@@ -436,7 +442,8 @@ class Studio(QtWidgets.QMainWindow):
         self.train_log.appendPlainText("=== 训练开始 ===")
         self.train_worker = TrainWorker(self.cfg_row.text(), self.inst_row.text(),
                                         self.sp_epochs.value(), self.sp_lr.value(),
-                                        self.sp_batch.value(), self.cb_device.currentText())
+                                        self.sp_batch.value(), self.cb_device.currentText(),
+                                        gpu_accel=(self.cb_gpu_accel.currentText() == "on"))
         self.train_worker.epoch.connect(self._on_epoch)
         self.train_worker.log.connect(lambda s: self.train_log.appendPlainText(s))
         self.train_worker.done.connect(self._train_done)

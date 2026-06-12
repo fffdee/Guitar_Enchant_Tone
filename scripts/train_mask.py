@@ -2,6 +2,7 @@
 
 用法:
   python scripts/train_mask.py --config configs/mask.json --epochs 200 --device cuda
+  python scripts/train_mask.py --config configs/mask.json --epochs 200 --device cuda --gpu-accelerate
 """
 
 import _paths  # noqa: F401
@@ -11,7 +12,7 @@ import argparse
 from esp_xform.config import load_instruments
 from esp_xform.mask.config import load_mask_config
 from esp_xform.mask.export import export_masknet_artifacts
-from esp_xform.mask.train import train
+from esp_xform.mask.train import train, train_gpu
 
 
 def main():
@@ -22,6 +23,8 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument("--proc", default=None)
     ap.add_argument("--no-export", action="store_true")
+    ap.add_argument("--gpu-accelerate", action="store_true",
+                    help="使用 GPU STFT 加速（仅 CUDA）")
     args = ap.parse_args()
 
     cfg = load_mask_config(args.config)
@@ -31,7 +34,11 @@ def main():
         cfg.paths.proc_dir = args.proc
 
     inst = load_instruments(args.instruments)["instruments"]
-    info = train(cfg, inst, device=args.device, proc_dir=args.proc)
+    
+    if args.gpu_accelerate and (args.device == "cuda" or (args.device is None and __import__('torch').cuda.is_available())):
+        info = train_gpu(cfg, inst, device=args.device, proc_dir=args.proc)
+    else:
+        info = train(cfg, inst, device=args.device, proc_dir=args.proc)
     print("[train_mask] training done:", info)
 
     if not args.no_export:
