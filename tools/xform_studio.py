@@ -182,13 +182,14 @@ class RenderWorker(QtCore.QThread):
     failed = QtCore.pyqtSignal(str)
 
     def __init__(self, ckpt, source, inst_name, inst_id, out_path, device, add_noise,
-                 pitch=0.0, gain=0.0, clip_mode="limit"):
+                 pitch=0.0, gain=0.0, clip_mode="limit", use_int8=False):
         super().__init__()
         self.ckpt, self.source, self.inst_name = ckpt, source, inst_name
         self.inst_id, self.out_path = inst_id, out_path
         self.device, self.add_noise, self.pitch = device, add_noise, float(pitch)
         self.gain = float(gain)
         self.clip_mode = clip_mode
+        self.use_int8 = bool(use_int8)
 
     def run(self):
         try:
@@ -198,12 +199,84 @@ class RenderWorker(QtCore.QThread):
             y = render_instrument(model, cfg, mats, mean, std, audio,
                                   int(self.inst_id), self.device, self.add_noise,
                                   pitch_semitones=self.pitch, gain_db=self.gain,
-                                  clip_mode=self.clip_mode)
+                                  clip_mode=self.clip_mode, use_int8=self.use_int8)
             Path(self.out_path).parent.mkdir(parents=True, exist_ok=True)
             save_wav(self.out_path, y, cfg.stft.sample_rate)
             in_stats = wav_stats(self.source)
             out_stats = wav_stats(self.out_path)
             self.done.emit(self.out_path, in_stats, out_stats)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class ExportWorker(QtCore.QThread):
+    """后台导出 xform_model.bin（避免界面卡死）。"""
+    log = QtCore.pyqtSignal(str)
+    done = QtCore.pyqtSignal(dict)     # result dict
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, ckpt_path, out_path, proc_dir=None, include_int8=True):
+        super().__init__()
+        self.ckpt_path = ckpt_path
+        self.out_path = out_path
+        self.proc_dir = proc_dir
+        self.include_int8 = bool(include_int8)
+
+    def run(self):
+        try:
+            import torch
+            import numpy as np
+            from esp_xform.mask.config import MaskConfig, _update
+            from esp_xform.mask.export import export_model_package
+            from esp_xform.mask.model import MaskNet
+
+            ckpt_path = Path(self.ckpt_path)
+            self.log.emit(f"加载检查点 … {ckpt_path}")
+            ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+
+            cfg = MaskConfig()
+            _update(cfg, ckpt["config"])
+            cfg.validate()
+            num_inst = int(ckpt.get("num_instruments", 1))
+            instr = ckpt.get("instruments", {f"inst{i}": i for i in range(num_inst)})
+
+            model = MaskNet(cfg, num_inst)
+            model.load_state_dict(ckpt["model_state"])
+            model.eval()
+
+            # 梅尔归一化统计
+            mel_mean = ckpt.get("mel_mean", None)
+            mel_std = ckpt.get("mel_std", None)
+            if mel_mean is None or mel_std is None:
+                if self.proc_dir:
+                    npz = Path(self.proc_dir) / "stats.npz"
+                    if npz.exists():
+                        st = np.load(str(npz))
+                        mel_mean = st["mel_mean"].astype(np.float32)
+                        mel_std = st["mel_std"].astype(np.float32)
+            if mel_mean is None:
+                self.log.emit("[警告] 未找到梅尔统计，使用占位零均值/单位方差")
+                mel_mean = np.zeros(cfg.stft.n_mels, np.float32)
+                mel_std = np.ones(cfg.stft.n_mels, np.float32)
+            mel_mean = np.asarray(mel_mean, dtype=np.float32)
+            mel_std = np.asarray(mel_std, dtype=np.float32)
+
+            self.log.emit(f"配置: sr={cfg.stft.sample_rate}  n_fft={cfg.stft.n_fft}  "
+                          f"n_mels={cfg.stft.n_mels}  hidden={cfg.model.hidden}")
+            self.log.emit(f"乐器 ({num_inst}): {list(instr.keys())}")
+            self.log.emit(f"参数量: {model.num_parameters():,}")
+
+            out_path = Path(self.out_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            self.log.emit(f"导出 → {out_path} … (INT8段: {'是' if self.include_int8 else '否'})")
+            result = export_model_package(model, cfg, mel_mean, mel_std, instr, out_path,
+                                          include_int8_weights=self.include_int8)
+
+            size_kb = int(result["bytes"]) / 1024
+            self.log.emit(f"完成: {size_kb:.1f} KB  乐器数={result['num_instruments']}")
+            result["size_kb"] = size_kb
+            result["out_path"] = str(out_path)
+            self.done.emit(result)
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -249,6 +322,7 @@ class Studio(QtWidgets.QMainWindow):
         self.train_worker = None
         self.pre_worker = None
         self.render_worker = None
+        self.export_worker = None
         self.ep_x, self.ep_tr, self.ep_val = [], [], []
 
         tabs = QtWidgets.QTabWidget()
@@ -502,12 +576,17 @@ class Studio(QtWidgets.QMainWindow):
         self.btn_loadckpt.clicked.connect(self.on_load_ckpt)
         self.cb_inst = QtWidgets.QComboBox()
         self.chk_noise = QtWidgets.QCheckBox("叠加噪声带"); self.chk_noise.setChecked(True)
+        self.chk_int8 = QtWidgets.QCheckBox("模拟MCU INT8")
+        self.chk_int8.setChecked(False)
+        self.chk_int8.setToolTip("勾选后用与 MCU 相同的 INT8 量化路径推理（较慢，用于验证 MCU 效果）")
+        self.chk_int8.stateChanged.connect(self._pitch_changed)
         self.btn_render = QtWidgets.QPushButton("渲染转换")
         self.btn_render.clicked.connect(self.on_render)
         row.addWidget(self.btn_loadckpt)
         row.addWidget(QtWidgets.QLabel("目标乐器"))
         row.addWidget(self.cb_inst, 1)
         row.addWidget(self.chk_noise)
+        row.addWidget(self.chk_int8)
         row.addWidget(self.btn_render)
         lay.addLayout(row)
 
@@ -593,6 +672,43 @@ class Studio(QtWidgets.QMainWindow):
         lay.addLayout(prow)
 
         self._last_out = None
+
+        # ── 模型导出区 ──
+        export_box = QtWidgets.QGroupBox("模型导出 → MCU 部署")
+        ebox = QtWidgets.QVBoxLayout(export_box)
+        erow1 = QtWidgets.QHBoxLayout()
+        self.export_out_row = PathRow("输出 .bin",
+                                      str(ROOT / "outputs" / "mask_style" / "exports" / "xform_model.bin"),
+                                      file_filter="模型包 (*.bin)")
+        self.export_proc_row = PathRow("proc 目录(可选, 提供梅尔统计)",
+                                       str(ROOT / "dataset" / "proc_style"), pick_dir=True)
+        self.chk_export_int8 = QtWidgets.QCheckBox("导出 INT8 权重段 (weights_i8, 供 MCU -8 加速)")
+        self.chk_export_int8.setChecked(True)
+        self.chk_export_int8.setToolTip("不勾选则 bin 更小 (~600KB), MCU 仅 F32 推理")
+        erow1.addWidget(self.export_out_row)
+        ebox.addLayout(erow1)
+        erow2 = QtWidgets.QHBoxLayout()
+        self.export_proc_row2 = self.export_proc_row  # 保留引用
+        erow2.addWidget(self.export_proc_row)
+        erow2.addWidget(self.chk_export_int8)
+        ebox.addLayout(erow2)
+        erow3 = QtWidgets.QHBoxLayout()
+        self.btn_export = QtWidgets.QPushButton("导出 xform_model.bin")
+        self.btn_export.clicked.connect(self.on_export)
+        self.btn_open_export_dir = QtWidgets.QPushButton("打开导出目录")
+        self.btn_open_export_dir.clicked.connect(
+            lambda: open_in_os(str(Path(self.export_out_row.text()).parent))
+            if self.export_out_row.text() else None)
+        erow3.addWidget(self.btn_export)
+        erow3.addWidget(self.btn_open_export_dir)
+        erow3.addStretch(1)
+        ebox.addLayout(erow3)
+        self.export_log = QtWidgets.QPlainTextEdit()
+        self.export_log.setReadOnly(True)
+        self.export_log.setMaximumHeight(80)
+        ebox.addWidget(self.export_log)
+        lay.addWidget(export_box)
+
         return w
 
     def on_load_ckpt(self):
@@ -629,17 +745,23 @@ class Studio(QtWidgets.QMainWindow):
         pitch = float(self.sp_pitch.value())
         gain = float(self.sp_gain.value())
         clip_mode = self.cb_clip.currentData() or "limit"
+        use_int8 = self.chk_int8.isChecked()
         psfx = f"_p{int(pitch):+d}" if abs(pitch) > 1e-6 else ""
         gsfx = f"_g{int(gain):+d}" if abs(gain) > 1e-6 else ""
         csfx = f"_{clip_mode}" if clip_mode != "limit" else ""
-        out = ROOT / "outputs" / "mask_style" / "renders" / f"{Path(src).stem}__to_{inst_name}{psfx}{gsfx}{csfx}.wav"
+        isfx = "_int8" if use_int8 else ""
+        out = ROOT / "outputs" / "mask_style" / "renders" / f"{Path(src).stem}__to_{inst_name}{psfx}{gsfx}{csfx}{isfx}.wav"
         self._rendered_pitch = pitch
         self._rendered_gain = gain
         self._rendered_clip = clip_mode
+        self._rendered_use_int8 = use_int8
         self.btn_render.setEnabled(False)
-        self.statusBar().showMessage(f"渲染中… (移频 {pitch:+.0f} 半音, 增益 {gain:+.0f} dB, {clip_mode})")
+        int8_tag = " INT8" if use_int8 else ""
+        self.statusBar().showMessage(
+            f"渲染中… (移频 {pitch:+.0f} 半音, 增益 {gain:+.0f} dB, {clip_mode}{int8_tag})")
         self.render_worker = RenderWorker(ckpt, src, inst_name, inst_id, str(out),
-                                          "cpu", self.chk_noise.isChecked(), pitch, gain, clip_mode)
+                                          "cpu", self.chk_noise.isChecked(), pitch, gain, clip_mode,
+                                          use_int8=use_int8)
         self.render_worker.done.connect(self._render_done)
         self.render_worker.failed.connect(self._render_failed)
         self.render_worker.start()
@@ -669,14 +791,18 @@ class Studio(QtWidgets.QMainWindow):
         pitch = self._rendered_pitch
         gain = self._rendered_gain
         clip_mode = self._rendered_clip
+        use_int8 = getattr(self, "_rendered_use_int8", False)
+        int8_tag = " INT8" if use_int8 else ""
         self._spec(self.iax_in, ins["y"], f"INPUT guitar  centroid={ins['centroid']:.0f}Hz  rms={ins['rms']:.4f}")
         self._spec(self.iax_out, outs["y"],
-                   f"OUTPUT  pitch{pitch:+.0f}st  gain{gain:+.0f}dB  {clip_mode}  centroid={outs['centroid']:.0f}Hz  rms={outs['rms']:.4f}")
+                   f"OUTPUT  pitch{pitch:+.0f}st  gain{gain:+.0f}dB  {clip_mode}{int8_tag}  "
+                   f"centroid={outs['centroid']:.0f}Hz  rms={outs['rms']:.4f}")
         self.ifig.tight_layout()
         self.icanvas.draw()
         self.infer_info.setText(
             f"输出: {out_path}\n"
-            f"移频  : {pitch:+.0f} 半音    输出增益: {gain:+.0f} dB    削波模式: {clip_mode}\n"
+            f"移频  : {pitch:+.0f} 半音    输出增益: {gain:+.0f} dB    削波模式: {clip_mode}"
+            f"    INT8: {'是' if use_int8 else '否'}\n"
             f"输入  : sr={ins['sr']} 时长={ins['dur']:.2f}s peak={ins['peak']:.3f} rms={ins['rms']:.4f} 质心={ins['centroid']:.0f}Hz\n"
             f"输出  : sr={outs['sr']} 时长={outs['dur']:.2f}s peak={outs['peak']:.3f} rms={outs['rms']:.4f} 质心={outs['centroid']:.0f}Hz")
         self.btn_render.setEnabled(True)
@@ -694,6 +820,49 @@ class Studio(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.critical(self, "渲染失败", tb)
         self.btn_render.setEnabled(True)
         self.statusBar().showMessage("渲染失败")
+
+    # ── 模型导出 ──
+    def on_export(self):
+        if self.export_worker and self.export_worker.isRunning():
+            return
+        ckpt = self.ckpt_row.text()
+        if not Path(ckpt).exists():
+            QtWidgets.QMessageBox.warning(self, "缺少检查点",
+                                          f"检查点不存在:\n{ckpt}\n\n请先在上方选择有效的 .pt 文件。")
+            return
+        out = self.export_out_row.text()
+        if not out:
+            QtWidgets.QMessageBox.warning(self, "缺少输出路径", "请指定导出 .bin 文件路径。")
+            return
+        proc_dir = self.export_proc_row.text() or None
+        self.btn_export.setEnabled(False)
+        self.export_log.clear()
+        self.export_log.appendPlainText(f"=== 导出开始 ===\n检查点: {ckpt}\n输出: {out}")
+        self.statusBar().showMessage("导出中…")
+        self.export_worker = ExportWorker(ckpt, out, proc_dir,
+                                          include_int8=self.chk_export_int8.isChecked())
+        self.export_worker.log.connect(lambda s: self.export_log.appendPlainText(s))
+        self.export_worker.done.connect(self._export_done)
+        self.export_worker.failed.connect(self._export_failed)
+        self.export_worker.start()
+
+    def _export_done(self, result):
+        size_kb = result.get("size_kb", 0)
+        n_inst = result.get("num_instruments", 0)
+        out_path = result.get("out_path", "")
+        self.export_log.appendPlainText(
+            f"=== 导出完成 ===\n"
+            f"文件: {out_path}\n"
+            f"大小: {size_kb:.1f} KB\n"
+            f"乐器数: {n_inst}\n"
+            f"下一步: 将 .bin 复制到 MCU SD 卡 /model/ 目录，重启固件即可。")
+        self.btn_export.setEnabled(True)
+        self.statusBar().showMessage(f"导出完成: {size_kb:.1f} KB  乐器={n_inst}")
+
+    def _export_failed(self, tb):
+        self.export_log.appendPlainText("导出失败:\n" + tb)
+        self.btn_export.setEnabled(True)
+        self.statusBar().showMessage("导出失败")
 
 
 def main():

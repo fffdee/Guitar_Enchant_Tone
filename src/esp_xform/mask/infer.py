@@ -14,8 +14,104 @@ import torch
 
 from .audio import apply_gain_db, build_all_matrices, pitch_shift_semitones, stft
 from .config import MaskConfig, _update  # type: ignore
+from .export import collect_conv1d_int8_weights
 from .model import MaskNet
 from .reconstruct import reconstruct_np
+
+
+def _conv1d_out_len(T: int, K: int, S: int, P: int, D: int) -> int:
+    return (T + 2 * P - D * (K - 1) - 1) // S + 1
+
+
+def conv1d_int8_np(x: np.ndarray, wp: dict) -> np.ndarray:
+    """Conv1d INT8 前向 (MCU layer_conv1d 对齐, dilation=1).
+
+    x: [Cin, T] f32 -> y: [Cout, To] f32
+    输入 per-tensor 量化; 权重 per-output-channel; im2col + int32 MAC + 反量化 + bias.
+    """
+    x = np.asarray(x, dtype=np.float32)
+    Cin, T = x.shape
+    W_i8 = wp["W_i8"]
+    Cout, Cin_K = W_i8.shape
+    K, S, P, D = wp["K"], wp["stride"], wp["padding"], wp["dilation"]
+    if D != 1:
+        raise ValueError("conv1d_int8_np 仅支持 dilation=1 (MCU INT8 路径限制)")
+    if Cin * K != Cin_K:
+        raise ValueError(f"Cin*K mismatch: {Cin}*{K} vs Cin_K={Cin_K}")
+
+    To = _conv1d_out_len(T, K, S, P, D)
+    scale_in = max(float(np.max(np.abs(x))), 1e-8) / 127.0
+    x_i8 = np.clip(np.round(x / scale_in), -128, 127).astype(np.int8)
+
+    col_i8 = np.zeros((To, Cin_K), dtype=np.int32)
+    for ci in range(Cin):
+        xrow = x_i8[ci]
+        for k in range(K):
+            col_idx = ci * K + k
+            base = k * D - P
+            for t in range(To):
+                idx = t * S + base
+                if 0 <= idx < T:
+                    col_i8[t, col_idx] = int(xrow[idx])
+
+    acc = col_i8 @ W_i8.astype(np.int32).T                     # [To, Cout]
+    out_scale = scale_in * wp["scale"].astype(np.float64)     # [Cout]
+    y = acc.astype(np.float64) * out_scale[None, :] + wp["bias_f32"][None, :]
+    return y.T.astype(np.float32)                             # [Cout, To]
+
+
+def _relu(x: np.ndarray) -> np.ndarray:
+    return np.maximum(x, 0.0)
+
+
+def _film_np(x: np.ndarray, film_mod, cond: torch.Tensor) -> np.ndarray:
+    """FiLM 保持 F32 (MCU 亦不走 INT8). x:[C,T]"""
+    xt = torch.from_numpy(x[None].astype(np.float32))
+    with torch.no_grad():
+        y = film_mod(xt, cond)
+    return y[0].cpu().numpy()
+
+
+def _conv_f32_np(x: np.ndarray, model: MaskNet, conv: torch.nn.Conv1d, dilation: int) -> np.ndarray:
+    xt = torch.from_numpy(x[None].astype(np.float32))
+    with torch.no_grad():
+        y = model._conv(xt, conv, dilation)
+    return y[0].cpu().numpy()
+
+
+@torch.no_grad()
+def predict_heads_int8(model: MaskNet, x: torch.Tensor, inst_id: int, device: str = "cpu"):
+    """模拟 MCU INT8 conv 路径 (dilation=1 层 INT8, 其余 F32), 返回 mask/dphi/noise numpy."""
+    x_np = x[0].cpu().numpy().astype(np.float32)
+    inst = torch.tensor([inst_id], dtype=torch.long, device=device)
+    cond = model.cond_vector(inst)
+    wpacks = collect_conv1d_int8_weights(model)
+    wi = 0
+
+    def run_conv(xin: np.ndarray, conv: torch.nn.Conv1d) -> np.ndarray:
+        nonlocal wi
+        wp = wpacks[wi]
+        wi += 1
+        if wp["dilation"] != 1:
+            return _conv_f32_np(xin, model, conv, wp["dilation"])
+        return conv1d_int8_np(xin, wp)
+
+    h = run_conv(x_np, model.c1)
+    h = _film_np(_relu(h), model.f1, cond)
+    h = run_conv(h, model.c2)
+    h = _film_np(_relu(h), model.f2, cond)
+    h = _relu(run_conv(h, model.c3))
+
+    h_mag = run_conv(h, model.head_mag)
+    mask = (1.0 / (1.0 + np.exp(-h_mag))) * float(model.gmax)
+
+    h_phase = run_conv(h, model.head_phase)
+    dphi = np.tanh(h_phase) * float(model.dphi_max)
+
+    h_noise = run_conv(h, model.head_noise)
+    noise = np.log1p(np.exp(h_noise))
+
+    return mask, dphi, noise
 
 
 def _cfg_from_dict(d: Dict) -> MaskConfig:
@@ -63,16 +159,20 @@ def predict_heads(model, x: torch.Tensor, inst_id: int, device: str = "cpu"):
 def render_instrument(model, cfg, mats, mel_mean, mel_std, audio: np.ndarray,
                       inst_id: int, device: str = "cpu", add_noise: bool = True,
                       pitch_semitones: float = 0.0, gain_db: float = 0.0,
-                      clip_mode: str = "limit") -> np.ndarray:
+                      clip_mode: str = "limit", use_int8: bool = False) -> np.ndarray:
     """整段吉他 -> 单一目标乐器音频。
 
     pitch_semitones: 运行时移频/变调（半音），把转换结果整体移到目标乐器音区
                      （吉他/贝斯/尤克里里空弦音区不同）。0=不变调，建议 ±12 内。
     gain_db: 运行时输出增益（dB），作为"驱动量"。
     clip_mode: 末级削波模式 limit(干净限幅) / soft(软饱和加谐波) / hard(硬削波)。
+    use_int8: True 时用 MCU 对齐的 INT8 conv 路径 (dilation=1 层), 用于试听/对拍。
     """
     Xlin, phase, x = _analyze(cfg, mats, mel_mean, mel_std, audio)
-    mask, dphi, noise = predict_heads(model, x, inst_id, device)
+    if use_int8:
+        mask, dphi, noise = predict_heads_int8(model, x, inst_id, device)
+    else:
+        mask, dphi, noise = predict_heads(model, x, inst_id, device)
     s = cfg.stft
     y = reconstruct_np(Xlin, phase, mask, dphi, noise,
                        mats["mel_inv"], mats["phase_inv"], mats["noise_fb"],
@@ -124,4 +224,5 @@ def render_switch(model, cfg, mats, mel_mean, mel_std, audio: np.ndarray,
 
 
 __all__ = ["load_mask_model", "render_instrument", "render_switch",
-           "build_switch_schedule", "predict_heads"]
+           "build_switch_schedule", "predict_heads", "predict_heads_int8",
+           "conv1d_int8_np"]

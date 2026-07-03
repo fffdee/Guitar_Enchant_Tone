@@ -9,6 +9,7 @@
  */
 
 #include "bnn_layer.h"
+#include "bnn_utils/bnn_perf.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -56,6 +57,33 @@ typedef struct bnn_embedding_cfg {
 int conv1d_set_weights_i8(bnn_layer_t *layer,
                           const int8_t *W_i8, const float *scale,
                           int Cout, int Cin_K);
+
+/* 运行时开关: 1=conv1d 已注入 W_i8 时走 INT8 快路径, 0=强制 F32 (默认). */
+void bnn_conv1d_set_int8_runtime(int on);
+int  bnn_conv1d_int8_runtime(void);
+
+/* ============================================================
+ * 性能优化接口 (由 bnn_perf.h 宏控制)
+ * ============================================================ */
+
+#if BNN_PERF_FUSE_BIAS_RELU
+/* 标记本层后接 ReLU, 允许融合到 GEMM epilogue。
+ * layer: conv1d 层指针
+ * on: 1=融合, 0=不融合
+ * 返回 0 成功, -1 失败。 */
+int conv1d_set_fuse_relu(bnn_layer_t *layer, int on);
+#endif
+
+#if BNN_PERF_WEIGHT_PREFETCH
+/* 预取权重到 SRAM 副本。
+ * layer: conv1d 层指针
+ * 返回 0 成功, -1 失败 (SRAM 不足或类型不匹配)。
+ * 调用后 conv1d_forward 会优先使用 SRAM 副本做 GEMM。 */
+int conv1d_prefetch_weight_sram(bnn_layer_t *layer);
+
+/* 释放 SRAM 副本 (切换乐器/卸载模型时调用) */
+void conv1d_release_weight_sram(bnn_layer_t *layer);
+#endif
 
 #ifdef __cplusplus
 }

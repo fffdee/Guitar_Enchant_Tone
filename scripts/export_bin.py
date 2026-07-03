@@ -63,6 +63,8 @@ def main() -> int:
                     help="预处理目录（含 stats.npz）；缺省时从检查点读取梅尔统计")
     ap.add_argument("--device",   default="cpu",
                     help="推理设备（cpu / cuda）；导出只需 cpu")
+    ap.add_argument("--no-int8", action="store_true",
+                    help="不写入 weights_i8 段 (MCU 仅 F32, bin 更小)")
     args = ap.parse_args()
 
     ckpt_path = Path(args.model)
@@ -103,11 +105,13 @@ def main() -> int:
     # ── 导出 xform_model.bin ───────────────────────────────────────────────
     out_path = Path(args.out)
     print(f"[export_bin] 导出 → {out_path.resolve()} …")
-    result = export_model_package(model, cfg, mel_mean, mel_std, instr, out_path)
+    result = export_model_package(model, cfg, mel_mean, mel_std, instr, out_path,
+                                  include_int8_weights=not args.no_int8)
 
     size_kb = int(result["bytes"]) / 1024
+    int8_tag = "含 INT8" if not args.no_int8 else "无 INT8 (F32 only)"
     print(f"[export_bin] 完成: {result['model_package']}")
-    print(f"[export_bin]   大小     : {size_kb:.1f} KB")
+    print(f"[export_bin]   大小     : {size_kb:.1f} KB  ({int8_tag})")
     print(f"[export_bin]   乐器数   : {result['num_instruments']}")
     print("=" * 56)
     print("  下一步：将 .bin 复制到 MCU SD 卡，重新启动固件即可。")

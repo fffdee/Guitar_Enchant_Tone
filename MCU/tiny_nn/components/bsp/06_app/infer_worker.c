@@ -76,9 +76,10 @@ static void worker_task(void *arg)
     for (;;) {
         if (xQueueReceive(s_queue, &job, portMAX_DELAY) != pdTRUE) continue;
 
-        ESP_LOGI(TAG, "开始推理: %s  %s -> %s (pitch %+.1f, gain %+.1fdB, clip %d)",
+        ESP_LOGI(TAG, "开始推理: %s  %s -> %s (pitch %+.1f, gain %+.1fdB, clip %d%s)",
                  job.instrument, job.in_path, job.out_path,
-                 job.opt.pitch_semitones, job.opt.gain_db, (int)job.opt.clip_mode);
+                 job.opt.pitch_semitones, job.opt.gain_db, (int)job.opt.clip_mode,
+                 job.opt.use_int8 ? ", INT8" : "");
         st_set_busy(job.instrument);
 
         int64_t t0 = esp_timer_get_time();

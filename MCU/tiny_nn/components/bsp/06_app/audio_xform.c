@@ -1,6 +1,7 @@
 #include "audio_xform.h"
 #include "model_store.h"
 #include "wav.h"
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -16,12 +17,49 @@
 #include "bnn_utils/bnn_workspace.h"
 #include "bnn_op/bnn_dsp.h"
 #include "bnn_op/bnn_op.h"
+#include "bnn_layer/bnn_xform_layers.h"
 #include "dsp_accel.h"
 #include "nn_accel.h"
 #include "dspm_mult.h"
 
 static const char *TAG = "xform";
 #define BLOCK_FRAMES 64
+
+/* 含 INT8 约 740880B; 无 INT8 约 598832B */
+#define XFORM_MODEL_EXPECT_BYTES 740880u
+#define XFORM_MODEL_MIN_BYTES    590000u
+#define XFORM_MODEL_MAX_BYTES    750000u
+
+static void validate_model_pkg(const model_pkg_t *pkg)
+{
+    if (!pkg) return;
+    ESP_LOGI(TAG, "model bin: %zu B (含INT8~%u / 无INT8~599KB)", pkg->buf_size, XFORM_MODEL_EXPECT_BYTES);
+    if (pkg->buf_size < XFORM_MODEL_MIN_BYTES || pkg->buf_size > XFORM_MODEL_MAX_BYTES)
+        ESP_LOGW(TAG, "bin 大小异常, 请确认 SD:/model/xform_model.bin 来自 exports/");
+    if (pkg->weights_i8 && pkg->weights_i8_size > 0)
+        ESP_LOGI(TAG, "bin 含 weights_i8 (%zuB), infer -8 可启用 INT8", pkg->weights_i8_size);
+    else
+        ESP_LOGI(TAG, "bin 无 weights_i8, 仅 F32 推理");
+
+    if (pkg->mel_mean && pkg->mel_std && pkg->mel_n >= 8) {
+        ESP_LOGI(TAG, "mel_norm[0:3]: mean=%.3f %.3f %.3f  std=%.3f %.3f %.3f",
+                 pkg->mel_mean[0], pkg->mel_mean[1], pkg->mel_mean[2],
+                 pkg->mel_std[0], pkg->mel_std[1], pkg->mel_std[2]);
+        if (fabsf(pkg->mel_mean[0]) < 0.01f && fabsf(pkg->mel_mean[1]) < 0.01f &&
+            fabsf(pkg->mel_std[0] - 1.0f) < 0.01f) {
+            ESP_LOGW(TAG, "mel_mean/std 似占位值 (0,1,...); 请用 checkpoint 重导出 xform_model.bin");
+        }
+    }
+
+    if (pkg->weights && pkg->weights_size > 16) {
+        const float *w = (const float *)((const uint8_t *)pkg->weights + 16);
+        float wabs = 0.0f;
+        for (int i = 0; i < 256; ++i) wabs += fabsf(w[i]);
+        ESP_LOGI(TAG, "weights sanity: w[0]=%.4f  sum|w[0:256]|=%.2f", w[0], wabs);
+        if (wabs < 1e-4f)
+            ESP_LOGE(TAG, "weights 似全零 — CNN 不会变换音色, 请更换 xform_model.bin");
+    }
+}
 
 /* 把 tinynn 内部日志转到 ESP 串口 (MCU 默认 sink 为 no-op, 否则看不到失败原因) */
 static void bnn_log_to_esp(int level, const char *msg, void *user)
@@ -31,10 +69,11 @@ static void bnn_log_to_esp(int level, const char *msg, void *user)
     else            ESP_LOGI("bnn", "%s", msg);
 }
 
-static model_pkg_t    s_pkg;
-static bnn_masknet_t *s_net = NULL;
-static bnn_mask_cfg_t s_cfg;
+model_pkg_t    s_pkg;
+bnn_masknet_t *s_net = NULL;
+bnn_mask_cfg_t s_cfg;
 static int            s_loaded = 0;
+static int            s_int8_ready = 0;      /* weights_i8 已注入且 ESP-NN 可用 */
 static void          *s_ws_sram_buf = NULL;  /* workspace 内部 SRAM 缓冲 */
 
 /*
@@ -176,6 +215,7 @@ esp_err_t audio_xform_init(const char *model_path)
 
     esp_err_t err = model_store_load(model_path, &s_pkg);
     if (err != ESP_OK) return err;
+    validate_model_pkg(&s_pkg);
 
     cfg_from_pkg(&s_cfg, &s_pkg);
     int num_inst = s_pkg.num_inst > 0 ? s_pkg.num_inst : 1;
@@ -190,7 +230,7 @@ esp_err_t audio_xform_init(const char *model_path)
 
     /* 接入 ESP32-P4 PIE 向量 NN 算子后端 (替换 cpu_ref GEMM/vec 慢路径).
      * Phase-1: dspm_mult_f32_arp4 (128-bit PIE GEMM) + dsps_dotprod/add/mul.
-     * Phase-2: nn_accel_init_int8() 启用 INT8 ESP-NN conv, 须先完成 INT8 权重导出. */
+     * Phase-2: nn_accel_init_int8() 启用 INT8 ESP-NN conv (当前默认禁用, 见下方). */
     if (nn_accel_init() == ESP_OK) {
         bnn_op_set_backend(nn_accel_backend());
         ESP_LOGI(TAG, "NN op 后端: esp-dsp P4 PIE GEMM/vec (Phase-1)");
@@ -216,24 +256,21 @@ esp_err_t audio_xform_init(const char *model_path)
     bnn_masknet_set_mel_norm(s_net, s_pkg.mel_mean, s_pkg.mel_std);
     bnn_masknet_set_embedding_table(s_net, s_pkg.emb, num_inst, s_pkg.emb_dim);
 
-    /* Phase 2: INT8 ESP-NN conv 加速.
-     * 仅在模型 bin 含 weights_i8 段且 ESP-NN 可用时启用.
-     * 若任一步骤失败则静默降级到 Phase-1 F32 路径. */
+    /* Phase 2 INT8: 预注入权重; 默认 F32 推理, infer/live -8 启用运行时开关. */
+    s_int8_ready = 0;
+    bnn_conv1d_set_int8_runtime(0);
     if (s_pkg.weights_i8 && s_pkg.weights_i8_size > 0) {
         int inj = bnn_masknet_load_weights_i8_mem(s_net,
                                                   s_pkg.weights_i8,
                                                   s_pkg.weights_i8_size);
-        if (inj > 0) {
-            if (nn_accel_init_int8() == ESP_OK) {
-                ESP_LOGI(TAG, "Phase-2 INT8: %d conv1d 层已注入 (ESP-NN PIE)", inj);
-            } else {
-                ESP_LOGW(TAG, "Phase-2 INT8 权重已注入 (%d 层), 但 ESP-NN 初始化失败 → 降级 F32", inj);
-            }
+        if (inj > 0 && nn_accel_init_int8() == ESP_OK) {
+            s_int8_ready = 1;
+            ESP_LOGI(TAG, "INT8 就绪: %d conv 层已注入 (默认 F32, infer -8 启用)", inj);
         } else {
-            ESP_LOGW(TAG, "INT8 权重注入失败 (%d), 降级 Phase-1 F32", inj);
+            ESP_LOGW(TAG, "INT8 注入/初始化失败 (inj=%d), 仅 F32", inj);
         }
     } else {
-        ESP_LOGI(TAG, "模型不含 INT8 权重段, 使用 Phase-1 F32 后端");
+        ESP_LOGI(TAG, "模型不含 INT8 段, 仅 F32 推理");
     }
 
     /* 注入 esp_timer 计时函数用于推理分段诊断 */
@@ -272,9 +309,21 @@ esp_err_t audio_xform_file(const char *in_wav, const char *out_wav,
     bnn_masknet_reset(s_net);
     bnn_masknet_perf_reset(s_net);              /* 清零诊断计时器 */
     bnn_ws_reset(NULL);                         /* 清空 workspace 峰值, 供基准计时 */
+
+    int use_int8 = 0;
+    if (opt && opt->use_int8) {
+        if (s_int8_ready) {
+            use_int8 = 1;
+        } else {
+            ESP_LOGW(TAG, "INT8 请求但不可用 (无 weights_i8 或未注入), 回退 F32");
+        }
+    }
+    bnn_conv1d_set_int8_runtime(use_int8);
+
     int out_n = 0;
     int64_t t0 = esp_timer_get_time();
     int rc = bnn_masknet_process_audio(s_net, x, n, y, &out_n);
+    bnn_conv1d_set_int8_runtime(0);
     int64_t dt_ms = (esp_timer_get_time() - t0) / 1000;
     size_t ws_peak_kb = bnn_ws_peak(NULL) / 1024;
     free(x);
@@ -294,8 +343,9 @@ esp_err_t audio_xform_file(const char *in_wav, const char *out_wav,
     /* ── 本次推理日志 ────────────────────────────────────────────────── */
     double rt_factor = (dt_ms > 0) ?
         (1000.0 * out_n / s_cfg.sample_rate) / (double)dt_ms : 0.0;
-    ESP_LOGI(TAG, "[infer#%"PRIu32"] %s  %lldms  %.2fx RT  ws=%zuKB",
-             s_stats.n, instrument, dt_ms, rt_factor, ws_peak_kb);
+    ESP_LOGI(TAG, "[infer#%"PRIu32"] %s  %lldms  %.2fx RT  ws=%zuKB%s",
+             s_stats.n, instrument, dt_ms, rt_factor, ws_peak_kb,
+             use_int8 ? " INT8" : "");
 
     /* 后处理: 先变调, 再增益/削波 (顺序与 PC 端 render_instrument 一致) */
     if (opt) {
@@ -314,6 +364,8 @@ esp_err_t audio_xform_file(const char *in_wav, const char *out_wav,
 }
 
 int audio_xform_loaded(void) { return s_loaded; }
+
+int audio_xform_int8_ready(void) { return s_loaded && s_int8_ready; }
 
 void audio_xform_print_model(void)
 {
@@ -374,6 +426,36 @@ void audio_xform_infer_progress(int *pct, int *frame, int *total)
     if (frame) *frame = f;
     if (total) *total = t;
     if (pct)   *pct   = (t > 0) ? (f * 100 / t) : 0;
+}
+
+esp_err_t audio_xform_debug(const char *in_wav, const char *instrument)
+{
+    if (!s_loaded || !s_net) { ESP_LOGE(TAG, "not initialized"); return ESP_ERR_INVALID_STATE; }
+    int id = model_store_instrument_id(&s_pkg, instrument);
+    if (id < 0) {
+        ESP_LOGW(TAG, "instrument '%s' 不在模型中", instrument);
+        return ESP_ERR_NOT_FOUND;
+    }
+    bnn_masknet_set_instrument(s_net, id);
+    bnn_masknet_set_add_noise(s_net, 0);
+    bnn_masknet_set_debug(s_net, 1);
+
+    float *x = NULL;
+    int n = 0, sr = 0;
+    esp_err_t err = wav_read_mono_f32(in_wav, &x, &n, &sr);
+    if (err != ESP_OK) return err;
+
+    float *y = (float *)psram_malloc((size_t)n * sizeof(float));
+    if (!y) { free(x); return ESP_ERR_NO_MEM; }
+
+    bnn_masknet_reset(s_net);
+    int out_n = 0;
+    int rc = bnn_masknet_process_audio(s_net, x, n, y, &out_n);
+    free(x);
+    free(y);
+    if (rc != 0) { ESP_LOGE(TAG, "debug process_audio rc=%d", rc); return ESP_FAIL; }
+    ESP_LOGI(TAG, "debug 完成: %s -> %s (%d smp)", in_wav, instrument, out_n);
+    return ESP_OK;
 }
 
 void audio_xform_deinit(void)

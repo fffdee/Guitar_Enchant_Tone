@@ -76,6 +76,39 @@ def _collect_conv1d_layers(model):
     return [m for m in model.ordered_modules() if isinstance(m, nn.Conv1d)]
 
 
+def _quantize_conv1d_weight(mod: nn.Conv1d) -> dict:
+    """单 Conv1d 对称 per-output-channel INT8 量化 (与 _bnnw_i8_bytes / MCU 一致)."""
+    W_f32 = mod.weight.detach().cpu().numpy().astype(np.float32)
+    Cout = int(W_f32.shape[0])
+    Cin = int(W_f32.shape[1])
+    K = int(W_f32.shape[2]) if W_f32.ndim == 3 else 1
+    Cin_K = Cin * K
+    W_flat = W_f32.reshape(Cout, Cin_K)
+    col_max = np.abs(W_flat).max(axis=1)
+    col_max = np.where(col_max < 1e-8, 1e-8, col_max)
+    scale = (col_max / 127.0).astype(np.float32)
+    W_i8 = np.clip(np.round(W_flat / scale[:, None]), -128, 127).astype(np.int8)
+    bias = mod.bias.detach().cpu().numpy().astype(np.float32)
+    return {
+        "W_i8": W_i8,
+        "scale": scale,
+        "bias_f32": bias,
+        "Cin": Cin,
+        "K": K,
+        "stride": int(mod.stride[0]),
+        "padding": int(mod.padding[0]),
+        "dilation": int(mod.dilation[0]),
+    }
+
+
+def collect_conv1d_int8_weights(model) -> List[dict]:
+    """返回每个 Conv1d 的 INT8 权重包, 顺序 c1,c2,c3,head_mag,head_phase,head_noise.
+
+    供 PC 端 predict_heads_int8 模拟 MCU INT8 conv (FiLM 层不在此列表).
+    """
+    return [_quantize_conv1d_weight(m) for m in _collect_conv1d_layers(model)]
+
+
 def _bnnw_i8_bytes(model) -> bytes:
     """INT8 权重段字节流, 供 MCU model_store 解析后喂给 layer_conv1d INT8 分支。
 
@@ -106,16 +139,11 @@ def _bnnw_i8_bytes(model) -> bytes:
     buf += struct.pack("<IIII", _BNNW_I8_MAGIC, _BNNW_I8_VERSION, num_conv, 0)
 
     for mod in conv_layers:
-        W_f32 = mod.weight.detach().cpu().numpy().astype(np.float32)  # [Cout, Cin, K]
-        Cout   = W_f32.shape[0]
-        Cin_K  = int(np.prod(W_f32.shape[1:]))                        # Cin * K
-        W_flat = W_f32.reshape(Cout, Cin_K)                           # [Cout, Cin*K]
-
-        # per-output-channel 对称量化
-        col_max = np.abs(W_flat).max(axis=1)                           # [Cout]
-        col_max = np.where(col_max < 1e-8, 1e-8, col_max)             # 避免除零
-        scale   = (col_max / 127.0).astype(np.float32)                # [Cout]
-        W_i8    = np.clip(np.round(W_flat / scale[:, None]), -128, 127).astype(np.int8)
+        pack = _quantize_conv1d_weight(mod)
+        W_i8 = pack["W_i8"]
+        Cout = W_i8.shape[0]
+        Cin_K = W_i8.shape[1]
+        scale = pack["scale"]
 
         w_bytes = W_i8.tobytes()
         nbytes  = len(w_bytes)
@@ -170,11 +198,13 @@ def _masknet_graph_ir(cfg, emb_dim: int, block_frames: int = PKG_BLOCK_FRAMES) -
 
 
 def export_model_package(model, cfg, mel_mean, mel_std,
-                         instruments: Dict[str, int], out_path: str | Path) -> Dict[str, str]:
+                         instruments: Dict[str, int], out_path: str | Path,
+                         include_int8_weights: bool = True) -> Dict[str, str]:
     """统一模型产物容器 xform_model.bin (单文件, 自带 TOC), 供 MCU model_store 解析。
 
-    段: config(i32) / weights(BNNW raw) / mel_mean(f32) / mel_std(f32) /
+    段: config(i32) / weights(BNNW raw) / [weights_i8] / mel_mean(f32) / mel_std(f32) /
         emb(f32 [N,E]) / names(乐器名, \\n 分隔)。新增乐器只需重导出, 固件不改。
+    include_int8_weights: False 时不写入 weights_i8 段 (MCU 仅 F32 推理).
     """
     s, m = cfg.stft, cfg.model
     emb = model.emb.weight.detach().cpu().numpy().astype("<f4")
@@ -190,20 +220,19 @@ def export_model_package(model, cfg, mel_mean, mel_std,
 
     graph_ir = _masknet_graph_ir(cfg, emb_dim)
 
-    # 预先生成 INT8 权重段 (避免在 sections 列表内重复调用 model)
-    weights_i8_data = _bnnw_i8_bytes(model)
-
-    # (name, dtype, shape, data_bytes)
     sections = [
         ("config",      PKG_DT_I32, [int(config.size)],     config.tobytes()),
         ("weights",     PKG_DT_RAW, [0],                     _bnnw_bytes(model)),
-        ("weights_i8",  PKG_DT_I8,  [0],                     weights_i8_data),  # INT8 量化权重
+    ]
+    if include_int8_weights:
+        sections.append(("weights_i8", PKG_DT_I8, [0], _bnnw_i8_bytes(model)))
+    sections.extend([
         ("mel_mean",    PKG_DT_F32, [int(mel_mean.size)],    mel_mean.tobytes()),
         ("mel_std",     PKG_DT_F32, [int(mel_std.size)],     mel_std.tobytes()),
         ("emb",         PKG_DT_F32, [num_inst, emb_dim],     emb.tobytes()),
         ("names",       PKG_DT_RAW, [len(names)],            names),
-        ("graph",       PKG_DT_RAW, [len(graph_ir)],         graph_ir),   # 数据驱动建图 IR
-    ]
+        ("graph",       PKG_DT_RAW, [len(graph_ir)],         graph_ir),
+    ])
     n = len(sections)
     cur = 16 + n * _PKG_TOC_ENTRY
     toc = b""
@@ -226,11 +255,13 @@ def export_model_package(model, cfg, mel_mean, mel_std,
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(buf)
-    return {"model_package": str(out), "bytes": str(len(buf)), "num_instruments": str(num_inst)}
+    return {"model_package": str(out), "bytes": str(len(buf)), "num_instruments": str(num_inst),
+            "include_int8_weights": str(int(include_int8_weights))}
 
 
 def export_masknet_artifacts(model, cfg, out_dir: str | Path,
-                             instruments: Dict[str, int], proc_dir: str | Path = None) -> Dict[str, str]:
+                             instruments: Dict[str, int], proc_dir: str | Path = None,
+                             include_int8_weights: bool = True) -> Dict[str, str]:
     """导出权重 + 展开矩阵 + 统计 + 乐器嵌入 + 配置，供 C 端 bnn_masknet 加载。"""
     out = Path(out_dir)
     exp = out / "exports"
@@ -266,7 +297,8 @@ def export_masknet_artifacts(model, cfg, out_dir: str | Path,
     np.save(exp / "instrument_embeddings.npy", emb)
 
     # 统一模型产物容器 (MCU 从 TF 卡读取这一个文件即可)
-    pkg = export_model_package(model, cfg, mel_mean, mel_std, instruments, exp / "xform_model.bin")
+    pkg = export_model_package(model, cfg, mel_mean, mel_std, instruments,
+                               exp / "xform_model.bin", include_int8_weights=include_int8_weights)
     result["model_package"] = pkg["model_package"]
 
     # 配置快照
@@ -285,4 +317,9 @@ def export_masknet_artifacts(model, cfg, out_dir: str | Path,
     return result
 
 
-__all__ = ["export_masknet_weights", "export_masknet_artifacts", "export_model_package"]
+__all__ = [
+    "export_masknet_weights",
+    "export_masknet_artifacts",
+    "export_model_package",
+    "collect_conv1d_int8_weights",
+]

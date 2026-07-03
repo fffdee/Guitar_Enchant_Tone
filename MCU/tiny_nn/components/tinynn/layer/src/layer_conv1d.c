@@ -1,9 +1,12 @@
 #include "bnn_layer/bnn_layer.h"
+#include "bnn_layer/bnn_xform_layers.h"
 #include "bnn_op/bnn_op.h"
 #include "bnn_op/bnn_nn.h"
+#include "bnn_op/bnn_dual_core.h"
 #include "bnn_utils/bnn_mem.h"
 #include "bnn_utils/bnn_workspace.h"
 #include "bnn_utils/bnn_log.h"
+#include "bnn_utils/bnn_perf.h"
 #include <math.h>
 #include <string.h>
 #include <float.h>
@@ -26,11 +29,29 @@ typedef struct {
     int Tin_cached, To_cached;
     float   *W, *b;
     bnn_layer_param_ref_t pref_w, pref_b;
+    /* 性能优化标志 (由 bnn_perf.h 宏控制) */
+#if BNN_PERF_FUSE_BIAS_RELU
+    int fuse_relu;   /* 1=本层后接 ReLU, 可融合到 GEMM epilogue */
+#endif
+#if BNN_PERF_WEIGHT_PREFETCH
+    float  *W_sram;  /* SRAM 权重副本 (预取), NULL=未预取 */
+    int     W_sram_valid; /* 1=W_sram 内容有效 */
+#endif
 #ifdef BNN_CONV1D_INT8_ACCEL
     int8_t  *W_i8;     /* [Cout, Cin*K] INT8 量化权重, NULL=未加载 */
     float   *W_scale;  /* [Cout] per-output-channel 量化尺度 */
 #endif
 } conv1d_t;
+
+#ifdef BNN_CONV1D_INT8_ACCEL
+static int s_conv1d_int8_runtime = 0;
+
+void bnn_conv1d_set_int8_runtime(int on) { s_conv1d_int8_runtime = on ? 1 : 0; }
+int  bnn_conv1d_int8_runtime(void) { return s_conv1d_int8_runtime; }
+#else
+void bnn_conv1d_set_int8_runtime(int on) { (void)on; }
+int  bnn_conv1d_int8_runtime(void) { return 0; }
+#endif
 
 static void rand_init(float *p, int fan_in, int n) {
     static unsigned int s = 0x6d2b79f5u;
@@ -72,6 +93,9 @@ static void conv1d_destroy(bnn_layer_t *self) {
     conv1d_t *c = (conv1d_t *)self;
     if (c->W) bnn_free(c->W);
     if (c->b) bnn_free(c->b);
+#if BNN_PERF_WEIGHT_PREFETCH
+    if (c->W_sram) heap_caps_free(c->W_sram);
+#endif
 #ifdef BNN_CONV1D_INT8_ACCEL
     if (c->W_i8)   bnn_free(c->W_i8);
     if (c->W_scale) bnn_free(c->W_scale);
@@ -218,8 +242,8 @@ static bnn_tensor_t *conv1d_forward(bnn_layer_t *self, bnn_tensor_t **inputs, in
     bnn_tensor_t *x = inputs[0];
 
 #ifdef BNN_CONV1D_INT8_ACCEL
-    /* INT8 快路径: W_i8 已加载且 ESP-NN 后端可用 */
-    if (c->W_i8 && c->W_scale) {
+    /* INT8 快路径: W_i8 已加载、运行时允许且 ESP-NN 后端可用 */
+    if (c->W_i8 && c->W_scale && bnn_conv1d_int8_runtime()) {
         bnn_tensor_t *r = conv1d_forward_int8(self, x);
         if (r) return r;
         /* workspace OOM 或后端未就绪: 回退 F32 路径 */
@@ -268,13 +292,50 @@ static bnn_tensor_t *conv1d_forward(bnn_layer_t *self, bnn_tensor_t **inputs, in
             }
         }
         float *Yb = Y + (size_t)bi * c->Cout * To;
-        /* gemm_nt: C[Cout,To] = W[Cout,Kall] × col_T[To,Kall]^T */
-        op->gemm_nt(c->W, col_T, NULL, Yb, c->Cout, To, Kall, 0);
-        for (int oc = 0; oc < c->Cout; ++oc) {
-            float bv = c->b[oc];
-            float *row = Yb + (size_t)oc * To;
-            for (int t = 0; t < To; ++t) row[t] += bv;
+
+        /* ── 权重选择: SRAM 预取副本优先 ── */
+#if BNN_PERF_WEIGHT_PREFETCH
+        const float *W_use = (c->W_sram_valid && c->W_sram) ? c->W_sram : c->W;
+#else
+        const float *W_use = c->W;
+#endif
+
+        /* ── GEMM 执行 (3 种路径, 由宏选择) ── */
+#if BNN_PERF_DUAL_CORE
+        /* 方案1: 双核通道分割 */
+        bnn_dual_core_gemm_nt_split(W_use, col_T, c->b, Yb,
+                                     c->Cout, To, Kall, 0);
+        /* bias 已在 gemm_nt 内部加 (通过 bias 参数) */
+#if BNN_PERF_FUSE_BIAS_RELU
+        if (c->fuse_relu) {
+            /* ReLU 已融合? 实际上 dual_core_gemm_nt_split 不支持融合,
+             * 这里单独做 ReLU (很快) */
+            size_t total = (size_t)c->Cout * To;
+            for (size_t i = 0; i < total; ++i)
+                if (Yb[i] < 0.0f) Yb[i] = 0.0f;
         }
+#endif
+#else
+        /* 原始单核路径 */
+#if BNN_PERF_FUSE_BIAS_RELU
+        if (c->fuse_relu) {
+            /* 融合: GEMM + bias, 然后原地 ReLU */
+            op->gemm_nt(W_use, col_T, c->b, Yb, c->Cout, To, Kall, 0);
+            size_t total = (size_t)c->Cout * To;
+            for (size_t i = 0; i < total; ++i)
+                if (Yb[i] < 0.0f) Yb[i] = 0.0f;
+        } else
+#endif
+        {
+            /* 标准路径: GEMM + bias */
+            op->gemm_nt(W_use, col_T, NULL, Yb, c->Cout, To, Kall, 0);
+            for (int oc = 0; oc < c->Cout; ++oc) {
+                float bv = c->b[oc];
+                float *row = Yb + (size_t)oc * To;
+                for (int t = 0; t < To; ++t) row[t] += bv;
+            }
+        }
+#endif /* BNN_PERF_DUAL_CORE */
     }
     bnn_ws_reset_to(NULL, mark);
     return self->cached_output;
@@ -332,3 +393,54 @@ int conv1d_set_weights_i8(bnn_layer_t *layer,
     return -1;  /* INT8 路径未编译 */
 }
 #endif /* BNN_CONV1D_INT8_ACCEL */
+
+/* ============================================================
+ * 性能优化接口实现 (由 bnn_perf.h 宏控制)
+ * ============================================================ */
+
+#if BNN_PERF_FUSE_BIAS_RELU
+int conv1d_set_fuse_relu(bnn_layer_t *layer, int on)
+{
+    if (!layer || !layer->type_name || strcmp(layer->type_name, "conv1d") != 0)
+        return -1;
+    conv1d_t *c = (conv1d_t *)layer;
+    c->fuse_relu = on ? 1 : 0;
+    return 0;
+}
+#endif
+
+#if BNN_PERF_WEIGHT_PREFETCH
+#include "esp_heap_caps.h"
+
+int conv1d_prefetch_weight_sram(bnn_layer_t *layer)
+{
+    if (!layer || !layer->type_name || strcmp(layer->type_name, "conv1d") != 0)
+        return -1;
+    conv1d_t *c = (conv1d_t *)layer;
+    size_t wn = (size_t)c->Cout * c->Cin * c->K * sizeof(float);
+    if (c->W_sram) {
+        if (c->W_sram_valid) return 0;  /* 已预取 */
+        heap_caps_free(c->W_sram);
+        c->W_sram = NULL;
+    }
+    c->W_sram = (float *)heap_caps_malloc(wn, MALLOC_CAP_INTERNAL);
+    if (!c->W_sram) {
+        BNN_LOGW("conv1d: SRAM 预取失败 (需 %u 字节)", (unsigned)wn);
+        return -1;
+    }
+    memcpy(c->W_sram, c->W, wn);
+    c->W_sram_valid = 1;
+    return 0;
+}
+
+void conv1d_release_weight_sram(bnn_layer_t *layer)
+{
+    if (!layer) return;
+    conv1d_t *c = (conv1d_t *)layer;
+    if (c->W_sram) {
+        heap_caps_free(c->W_sram);
+        c->W_sram = NULL;
+        c->W_sram_valid = 0;
+    }
+}
+#endif

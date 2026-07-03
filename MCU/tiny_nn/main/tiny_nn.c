@@ -1,24 +1,17 @@
 /*
  * ESP-GT-XFORM @ ESP32-P4 主程序。
  *
- * 两种运行模式:
- *   1. SD 卡模式 (默认): 从 SD 卡读取 WAV -> 推理 -> 写回 SD 卡
- *   2. I2S 实时模式: I2S RX 采集音频 -> 推理 -> I2S TX 输出
- *
- * 启动时通过 GPIO0 (BOOT 按钮) 选择模式:
- *   - 按住 BOOT 启动: I2S 实时模式
- *   - 正常启动: SD 卡模式
- * 也可在命令行中随时切换:
- *   mode sd    切换到 SD 卡模式
- *   mode i2s   切换到 I2S 实时模式
+ * 默认模式: I2S 实时音色转换 (I2S RX → 推理 → I2S TX)
+ * 可切换模式:
+ *   mode sd    切换到 SD 卡文件模式
+ *   mode i2s   切换回 I2S 实时模式
  *
  * 命令行示例:
- *   model                      查看模型信息(乐器列表/采样率/参数量)
- *   infer bass -p -12 -g 9 -c soft   SD卡模式: 转换为 bass
- *   mode i2s                   切换到 I2S 实时模式
- *   live bass -p -12 -g 9      I2S模式: 实时转换为 bass
- *   live stop                  停止实时推理
- *   status / ls /sdcard/out    查看进度 / 取结果
+ *   model                            查看模型信息(乐器列表/采样率/参数量)
+ *   live bass -p -12 -g 9 -c soft    I2S模式: 实时转换为 bass
+ *   live stop                        停止实时推理
+ *   infer bass -p -12 -g 9 -c soft   SD卡模式: 文件转换
+ *   status / ls /sdcard/out          查看进度 / 取结果
  *
  * TF 卡放置:
  *   /sdcard/model/xform_model.bin   (PC 端 export_model_package 产物)
@@ -27,18 +20,17 @@
  */
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-#include "driver/gpio.h"
 #include "bsp.h"
 #include "audio_xform.h"
 #include "infer_worker.h"
 #include "i2s_driver.h"
 #include "i2s_xform.h"
+#include "wm8978.h"
 #include "cli.h"
 
 static const char *TAG = "app";
 
 #define MODEL_PATH  BSP_SD_MOUNT "/model/xform_model.bin"
-#define BOOT_BTN    GPIO_NUM_0   /* BOOT 按钮, 用于选择启动模式 */
 
 /* 运行模式 */
 typedef enum {
@@ -46,21 +38,7 @@ typedef enum {
     RUN_MODE_I2S,      /* I2S 实时模式 */
 } run_mode_t;
 
-static run_mode_t s_mode = RUN_MODE_SD;
-
-/* 检测 BOOT 按钮是否按下 (低电平有效) */
-static int boot_btn_pressed(void)
-{
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << BOOT_BTN),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf);
-    return (gpio_get_level(BOOT_BTN) == 0);
-}
+static run_mode_t s_mode = RUN_MODE_I2S;   /* 默认 I2S 实时音色转换 */
 
 void app_main(void)
 {
@@ -75,14 +53,9 @@ void app_main(void)
     if (psram_total == 0)
         ESP_LOGE(TAG, "PSRAM 未初始化! 检查 sdkconfig SPIRAM");
 
-    /* 检测启动模式: 按住 BOOT 按钮启动 -> I2S 实时模式 */
-    if (boot_btn_pressed()) {
-        s_mode = RUN_MODE_I2S;
-        ESP_LOGI(TAG, "检测到 BOOT 按键: I2S 实时模式");
-    } else {
-        s_mode = RUN_MODE_SD;
-        ESP_LOGI(TAG, "SD 卡文件模式 (按住 BOOT 启动可切换 I2S 实时模式)");
-    }
+    /* 默认 I2S 实时音色转换模式 */
+    s_mode = RUN_MODE_I2S;
+    ESP_LOGI(TAG, "I2S 实时音色转换模式 (输入->推理->输出)");
 
     /* BSP 初始化 (SD 卡 + FATFS) */
     if (bsp_init() != ESP_OK) {
@@ -97,8 +70,16 @@ void app_main(void)
     else
         audio_xform_print_model();
 
-    /* I2S 模式: 初始化驱动并自动启动实时推理 */
+    /* I2S 模式: 初始化 WM8978 CODEC + I2S 驱动, 然后自动启动实时推理 */
     if (s_mode == RUN_MODE_I2S && audio_xform_loaded()) {
+        /* 先初始化 WM8978 编解码器 (I2C 控制) */
+        if (wm8978_init(0) == ESP_OK) {
+            wm8978_start();
+            ESP_LOGI(TAG, "WM8978 CODEC 已启动");
+        } else {
+            ESP_LOGW(TAG, "WM8978 初始化失败, I2S 将使用裸模式 (无 CODEC 配置)");
+        }
+        /* 再初始化 I2S 驱动 (CODEC 需要先上电才能正确响应 I2S 时钟) */
         if (i2s_driver_init(0) == ESP_OK) {
             i2s_xform_cfg_t cfg = {
                 .instrument = "bass",

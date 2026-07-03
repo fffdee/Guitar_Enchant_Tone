@@ -1,23 +1,22 @@
-# bnn_sensot — 纯 C 轻量神经网络推理 & 训练框架
+# tinynn — 纯 C 轻量神经网络推理框架
 
-面向 MCU / Linux 的极简框架。设计三原则：**与硬件解耦**、**移植方便**、**接口面向对象**。
-按职责分层，项目即在此框架上由各组件组合而成（缺组件就在对应层组新增）。
+面向 MCU / Linux 的极简**通用推理引擎**。设计三原则：**与硬件解耦**、**与项目解耦**、**移植方便**。
+
+框架只包含与项目无关的通用能力，项目特有的代码（模型/合成/前端/效果器等）放在 `bsp/07_tinynn_app/` 中。
 
 | 层组 | 目录 | 作用 |
 |----|------|------|
 | 工具层 | `utils/`    | 内存池(静态/动态) / tensor / workspace(bump) / log(可重定向) / optimizer / loss / dataset |
-| 算子层 | `operator/` | compute 后端(`bnn_op`) + DSP/FFT 后端(`bnn_dsp`) + 频谱矩阵(`bnn_specmat`) + 复音判别(`bnn_polyphony`, §8) |
+| 算子层 | `operator/` | compute 后端(`bnn_op`) + DSP/FFT 后端(`bnn_dsp`) + NN 算子(`bnn_nn`) |
 | 结构层 | `layer/`    | dense / conv2d / **conv1d** / **film**(可选 γ/(1+γ)) / **embedding** / activation(含 softplus/缩放) / residual…，vtbl + 静态注册 |
-| 计算图层 | `graph/`  | 用户构图 / 前向 / 反向 / 多头输出 / 权重存取(文件可裁剪, 内存加载始终可用) |
-| 前端组 | `frontend/` | DDSP: `bnn_frontend`(20 维吉他特征+f0)；谱掩码: `bnn_specfront`(STFT→对数梅尔+幅度/相位) |
-| 合成组 | `synth/`    | DDSP: `bnn_synth`(谐波+子带噪声)；谱掩码: `bnn_specsynth`(掩码作用+相位复用残差+ISTFT/OLA+噪声) |
-| 模型层 | `model/`    | `bnn_xform`(单音 DDSP 模式)；`bnn_masknet`(复音谱掩码主线，含增益平滑/噪声门) 端到端运行时 |
-| 效果器 | `effect/`   | `bnn_fx` 传统 DSP 失真(波形整形 tanh/cubic/hard + 过采样抗混叠, §7)，与 NN 正交可串联 |
+| 计算图层 | `graph/`  | 用户构图 / 前向 / 反向 / 多头输出 / 权重存取(文件可裁剪, 内存加载始终可用) / 图 IR(数据驱动建图) |
 
-> 两条音色转换路线（对应 `IMPLEMENTATION.md` §8 双模）：
-> - **复音谱掩码（主线）** `bnn_masknet`：STFT→梅尔掩码 CNN(三头)→相位复用 IFFT，原生支持和弦，算力与音符数无关。
-> - **单音 DDSP（§8 深变换）** `bnn_xform`：F0+谐波加性合成，做更深的单音变换。
-> 两者复用同一套 utils/operator/layer/graph 框架，体现"项目=组件组合"。
+> 项目特有的扩展（放在 `bsp/07_tinynn_app/`）：
+> - **前端组** `frontend/`：DDSP 特征提取(`bnn_frontend`)；谱掩码前端(`bnn_specfront`)
+> - **合成组** `synth/`：DDSP 谐波合成(`bnn_synth`)；谱掩码合成(`bnn_specsynth`)
+> - **模型层** `model/`：`bnn_xform`(单音 DDSP)；`bnn_masknet`(复音谱掩码)
+> - **效果器** `effect/`：`bnn_fx` 传统 DSP 失真
+> - **项目算子**：频谱矩阵(`bnn_specmat`)；复音判别(`bnn_polyphony`)
 
 ## 三原则的体现
 

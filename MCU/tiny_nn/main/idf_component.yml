@@ -17,3 +17,4 @@ dependencies:
   espressif/esp-dsp: '*'
   espressif/esp-nn: '*'
   espressif/esp_tinyusb: '*'
+  espressif/esp_codec_dev: '~1.4.0'
